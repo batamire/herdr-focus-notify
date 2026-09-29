@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
+use crate::executable::home_dir;
 use crate::icons::agent_icon_path;
 use crate::notification::FocusNotification;
 use crate::util::notification_group_id;
@@ -15,6 +18,10 @@ struct EventData {
     agent_status: Option<String>,
     agent: Option<String>,
     display_agent: Option<String>,
+    /// The pane's terminal title: what that agent or shell is working on.
+    title: Option<String>,
+    /// Labels Herdr reports per status, e.g. `{"blocked": "Needs an answer"}`.
+    state_labels: Option<BTreeMap<String, String>>,
 }
 
 /// The agent statuses worth notifying about. `blocked` and `done` are the
@@ -54,17 +61,25 @@ pub(crate) fn notification_from_event_json(
         .to_string();
     let app_icon = agent_icon_path(&[data.display_agent.as_deref(), data.agent.as_deref()]);
 
-    let (title, body) = match status.as_str() {
-        "blocked" => (
-            format!("{agent} needs your input"),
-            "Open the pane to review and respond.".to_string(),
-        ),
-        "done" => (
-            format!("{agent} finished"),
-            "Open the pane to review the result.".to_string(),
-        ),
-        _ => unreachable!("status already filtered"),
-    };
+    // The event's task title and status label are what tell two notifications
+    // apart; the static copy below is only the fallback for panes that report
+    // neither.
+    let detail = first_non_empty([
+        data.title.as_deref(),
+        data.state_labels
+            .as_ref()
+            .and_then(|labels| labels.get(status.as_str()))
+            .map(String::as_str),
+    ]);
+
+    let title = format!("{agent} {status}");
+    let body = detail
+        .map(str::to_string)
+        .unwrap_or_else(|| match status.as_str() {
+            "blocked" => "Open the pane to review and respond.".to_string(),
+            "done" => "Open the pane to review the result.".to_string(),
+            _ => unreachable!("status already filtered"),
+        });
     let group = notification_group_id(&pane_id);
 
     Ok(Some(FocusNotification {
@@ -72,6 +87,7 @@ pub(crate) fn notification_from_event_json(
         status,
         title,
         body,
+        subtitle: None,
         group,
         app_icon,
     }))
@@ -100,6 +116,41 @@ fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {
         .find(|value| !value.is_empty())
 }
 
+/// Names the workspace and the work in the notification. Every input is
+/// optional, so a failed `herdr` call leaves the event-only message in place.
+pub(crate) fn enrich_notification(
+    notification: &mut FocusNotification,
+    workspace_label: Option<&str>,
+    cwd: Option<&str>,
+    terminal_title: Option<&str>,
+) {
+    if let Some(label) = trimmed(workspace_label) {
+        notification.title = format!("{} · {label}", notification.title);
+    }
+    if let Some(task) = trimmed(terminal_title) {
+        notification.body = task.to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(cwd) = trimmed(cwd) {
+        parts.push(abbreviate_home(cwd));
+    }
+    parts.push(notification.pane_id.clone());
+    notification.subtitle = Some(parts.join(" · "));
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// `$HOME` becomes `~`, so a long path still fits the one-line subtitle.
+fn abbreviate_home(path: &str) -> String {
+    match home_dir().and_then(|home| path.strip_prefix(home.to_str()?).map(str::to_string)) {
+        Some(rest) => format!("~{rest}"),
+        None => path.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,7 +166,7 @@ mod tests {
                 "agent": "codex",
                 "display_agent": "Codex",
                 "title": "Implement plugin",
-                "custom_status": "Needs an answer"
+                "state_labels": {"blocked": "Needs an answer"}
             }
         }"#;
 
@@ -123,8 +174,9 @@ mod tests {
 
         assert_eq!(notification.pane_id, "w1:p3");
         assert_eq!(notification.status, "blocked");
-        assert_eq!(notification.title, "Codex needs your input");
-        assert_eq!(notification.body, "Open the pane to review and respond.");
+        assert_eq!(notification.title, "Codex blocked");
+        assert_eq!(notification.body, "Implement plugin");
+        assert_eq!(notification.subtitle, None);
         assert_eq!(notification.group, "herdr-w1-p3");
         assert!(notification
             .app_icon
@@ -147,26 +199,86 @@ mod tests {
         let notification = notification_from_event_json(json).unwrap().unwrap();
 
         assert_eq!(notification.status, "done");
-        assert_eq!(notification.title, "Codex finished");
-        assert_eq!(notification.body, "Open the pane to review the result.");
+        assert_eq!(notification.title, "Codex done");
+        assert_eq!(notification.body, "Implement plugin");
         assert!(notification.app_icon.is_some());
     }
 
     #[test]
-    fn keeps_notification_copy_simple_when_event_has_status_details() {
+    fn falls_back_to_static_copy_when_the_event_has_no_details() {
         let json = r#"{
             "data": {
                 "pane_id": "p1",
                 "agent_status": "blocked",
-                "agent": "Codex",
-                "state_labels": {"reason": "Needs an answer"}
+                "agent": "Codex"
             }
         }"#;
 
         let notification = notification_from_event_json(json).unwrap().unwrap();
 
-        assert_eq!(notification.title, "Codex needs your input");
+        assert_eq!(notification.title, "Codex blocked");
         assert_eq!(notification.body, "Open the pane to review and respond.");
+    }
+
+    #[test]
+    fn falls_back_to_the_status_label_when_the_event_has_no_title() {
+        let json = r#"{
+            "data": {
+                "pane_id": "p1",
+                "agent_status": "blocked",
+                "agent": "Codex",
+                "state_labels": {"blocked": "Needs an answer"}
+            }
+        }"#;
+
+        let notification = notification_from_event_json(json).unwrap().unwrap();
+
+        assert_eq!(notification.body, "Needs an answer");
+    }
+
+    #[test]
+    fn enrichment_names_workspace_task_and_pane_directory() {
+        let json = r#"{
+            "data": {
+                "pane_id": "w1:p3",
+                "agent_status": "blocked",
+                "agent": "Codex"
+            }
+        }"#;
+        let mut notification = notification_from_event_json(json).unwrap().unwrap();
+
+        enrich_notification(
+            &mut notification,
+            Some(" sample-repo "),
+            Some("/tmp/sample-repo"),
+            Some("Tidy up the parser tests"),
+        );
+
+        assert_eq!(notification.title, "Codex blocked · sample-repo");
+        assert_eq!(notification.body, "Tidy up the parser tests");
+        assert_eq!(
+            notification.subtitle.as_deref(),
+            Some("/tmp/sample-repo · w1:p3")
+        );
+    }
+
+    #[test]
+    fn enrichment_keeps_the_event_message_when_metadata_is_missing() {
+        let json = r#"{
+            "data": {
+                "pane_id": "w1:p3",
+                "agent_status": "blocked",
+                "agent": "Codex",
+                "title": "Implement plugin"
+            }
+        }"#;
+        let mut notification = notification_from_event_json(json).unwrap().unwrap();
+
+        enrich_notification(&mut notification, None, Some(""), Some("  "));
+
+        assert_eq!(notification.title, "Codex blocked");
+        assert_eq!(notification.body, "Implement plugin");
+        assert_eq!(notification.subtitle.as_deref(), Some("w1:p3"));
     }
 
     #[test]

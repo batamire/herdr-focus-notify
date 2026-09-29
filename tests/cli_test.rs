@@ -237,13 +237,13 @@ fn test_mode_notifies_even_when_pane_is_visible_and_status_filtered() {
 
 #[cfg(unix)]
 #[test]
-fn normal_notification_uses_status_specific_copy_without_requesting_an_explanation() {
+fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     let temp_dir = temp_test_dir();
 
     let herdr = temp_dir.join("herdr");
     write_executable(
         &herdr,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$2\" = \"get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\"}}}'\nfi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$2\" = \"get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"cwd\":\"/tmp/sample-repo\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
     );
 
     let notifier = temp_dir.join("alerter");
@@ -281,9 +281,10 @@ fn normal_notification_uses_status_specific_copy_without_requesting_an_explanati
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    assert!(notifier_output.contains("Codex needs your input"));
-    assert!(notifier_output.contains("Open the pane to review and respond."));
-    assert!(!notifier_output.contains("Implement plugin"));
+    assert!(notifier_output.contains("Codex blocked · sample-repo"));
+    assert!(notifier_output.contains("Tidy up the parser tests"));
+    assert!(notifier_output.contains("--subtitle"));
+    assert!(notifier_output.contains("/tmp/sample-repo · w1:p2"));
     assert!(!fs::read_to_string(&herdr_log)
         .unwrap_or_default()
         .contains("explain"));

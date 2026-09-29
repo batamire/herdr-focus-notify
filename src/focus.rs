@@ -37,6 +37,24 @@ struct AgentGetResult {
 struct AgentInfo {
     focused: bool,
     pane_id: Option<String>,
+    cwd: Option<String>,
+    terminal_title_stripped: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceListEnvelope {
+    result: Option<WorkspaceListResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceListResult {
+    workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceInfo {
+    workspace_id: String,
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +71,75 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
         status: "blocked".to_string(),
         title: "Focus notification test".to_string(),
         body: "Click to return to this Herdr pane.".to_string(),
+        subtitle: None,
         group: format!("herdr-{}", sanitize_group_id(&pane_id)),
         app_icon: None,
     }
+}
+
+/// Pane details a status event does not carry: what the pane is working on,
+/// where, and which workspace it belongs to.
+///
+/// Best-effort by design: any field stays empty when Herdr cannot answer, and
+/// the notification then falls back to the event's own message.
+pub(crate) struct PaneMetadata {
+    pub(crate) cwd: Option<String>,
+    pub(crate) terminal_title: Option<String>,
+    pub(crate) workspace_label: Option<String>,
+}
+
+pub(crate) fn pane_metadata(pane_id: &str, herdr_bin: &str) -> PaneMetadata {
+    let agent = command_stdout(herdr_bin, &["agent", "get", pane_id])
+        .and_then(|json| agent_metadata_from_get_json(&json).ok().flatten());
+
+    let workspace = crate::util::workspace_id_from_pane_id(pane_id).unwrap_or("default");
+    let workspace_label = command_stdout(herdr_bin, &["workspace", "list"]).and_then(|json| {
+        workspace_label_from_list_json(&json, workspace)
+            .ok()
+            .flatten()
+    });
+
+    PaneMetadata {
+        cwd: agent.as_ref().and_then(|meta| meta.cwd.clone()),
+        terminal_title: agent.and_then(|meta| meta.terminal_title),
+        workspace_label,
+    }
+}
+
+struct AgentMetadata {
+    cwd: Option<String>,
+    terminal_title: Option<String>,
+}
+
+fn agent_metadata_from_get_json(json: &str) -> Result<Option<AgentMetadata>, String> {
+    let envelope: AgentGetEnvelope =
+        serde_json::from_str(json).map_err(|err| format!("invalid agent get json: {err}"))?;
+
+    Ok(envelope
+        .result
+        .and_then(|result| result.agent)
+        .map(|agent| AgentMetadata {
+            cwd: agent.cwd,
+            terminal_title: agent.terminal_title_stripped,
+        }))
+}
+
+fn workspace_label_from_list_json(
+    json: &str,
+    workspace_id: &str,
+) -> Result<Option<String>, String> {
+    let envelope: WorkspaceListEnvelope =
+        serde_json::from_str(json).map_err(|err| format!("invalid workspace list json: {err}"))?;
+
+    Ok(envelope
+        .result
+        .and_then(|result| {
+            result
+                .workspaces
+                .into_iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+        })
+        .and_then(|workspace| workspace.label))
 }
 
 /// Activates the workspace's bound terminal and focuses the target pane.
@@ -354,6 +438,37 @@ fn notification_decision_from_focus_and_bundles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_pane_metadata_from_agent_get_json() {
+        let json = r#"{"result":{"agent":{"focused":false,"pane_id":"w1:p3",
+            "cwd":"/Users/me/sample-repo","terminal_title_stripped":"Tidy up the parser tests"}}}"#;
+
+        let metadata = agent_metadata_from_get_json(json).unwrap().unwrap();
+
+        assert_eq!(metadata.cwd.as_deref(), Some("/Users/me/sample-repo"));
+        assert_eq!(
+            metadata.terminal_title.as_deref(),
+            Some("Tidy up the parser tests")
+        );
+        assert!(agent_metadata_from_get_json("not json").is_err());
+    }
+
+    #[test]
+    fn reads_the_workspace_label_from_workspace_list_json() {
+        let json = r#"{"result":{"workspaces":[
+            {"workspace_id":"w1","label":"sample-repo"},
+            {"workspace_id":"w2"}]}}"#;
+
+        assert_eq!(
+            workspace_label_from_list_json(json, "w1")
+                .unwrap()
+                .as_deref(),
+            Some("sample-repo")
+        );
+        assert_eq!(workspace_label_from_list_json(json, "w2").unwrap(), None);
+        assert_eq!(workspace_label_from_list_json(json, "w9").unwrap(), None);
+    }
 
     #[test]
     fn finds_focused_pane_from_pane_list_json() {

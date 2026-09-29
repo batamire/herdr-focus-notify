@@ -115,6 +115,15 @@ fn alerter_focus_script(
         .as_ref()
         .map(|path| format!(" --app-icon {}", shell_quote(path)))
         .unwrap_or_default();
+    // Optional: a pane Herdr cannot describe, or a message built in tests,
+    // simply goes without a subtitle.
+    let subtitle_args = notification
+        .subtitle
+        .as_deref()
+        .map(str::trim)
+        .filter(|subtitle| !subtitle.is_empty())
+        .map(|subtitle| format!(" --subtitle {}", shell_quote(subtitle)))
+        .unwrap_or_default();
     let timeout_args = if timeout_secs > 0 {
         format!(" --timeout {}", timeout_secs)
     } else {
@@ -136,12 +145,13 @@ fn alerter_focus_script(
         cleared_marker = cleared_marker_q
     ));
     script.push_str(&format!(
-        "result_path=$(mktemp {result_template}) || exit 1\nstatus_path=$(mktemp {status_template}) || {{ rm -f \"$result_path\"; exit 1; }}\nmonitor_pid=\ncleanup() {{\n  [ -z \"$monitor_pid\" ] || kill \"$monitor_pid\" 2>/dev/null\n  rm -f \"$result_path\" \"$status_path\"\n}}\ntrap cleanup EXIT\n(\n  {notifier} --title {title} --message {body} --group {group}{app_icon_args} --actions {action} --close-label {close_label}{timeout_args} > \"$result_path\" 2>/dev/null\n  printf '%s' \"$?\" > \"$status_path\"\n) &\nnotifier_pid=$!\n",
+        "result_path=$(mktemp {result_template}) || exit 1\nstatus_path=$(mktemp {status_template}) || {{ rm -f \"$result_path\"; exit 1; }}\nmonitor_pid=\ncleanup() {{\n  [ -z \"$monitor_pid\" ] || kill \"$monitor_pid\" 2>/dev/null\n  rm -f \"$result_path\" \"$status_path\"\n}}\ntrap cleanup EXIT\n(\n  {notifier} --title {title} --message {body}{subtitle_args} --group {group}{app_icon_args} --actions {action} --close-label {close_label}{timeout_args} > \"$result_path\" 2>/dev/null\n  printf '%s' \"$?\" > \"$status_path\"\n) &\nnotifier_pid=$!\n",
         result_template = result_template_q,
         status_template = status_template_q,
         notifier = notifier_q,
         title = title_q,
         body = body_q,
+        subtitle_args = subtitle_args,
         group = group_q,
         app_icon_args = app_icon_args,
         action = shell_quote("Focus"),
@@ -248,8 +258,9 @@ mod tests {
         FocusNotification {
             pane_id: "w1:p3".to_string(),
             status: "blocked".to_string(),
-            title: "Codex needs your input".to_string(),
+            title: "Codex blocked · sample-repo".to_string(),
             body: "Open the pane to review and respond.".to_string(),
+            subtitle: Some("~/sample-repo · w1:p3".to_string()),
             group: "herdr-w1-p3".to_string(),
             app_icon: Some("/tmp/codex icon.png".to_string()),
         }
@@ -267,8 +278,11 @@ mod tests {
         );
 
         assert!(script.starts_with("#!/bin/sh\n"));
-        assert!(script.contains("'/opt/homebrew/bin/alerter' --title 'Codex needs your input'"));
+        assert!(
+            script.contains("'/opt/homebrew/bin/alerter' --title 'Codex blocked · sample-repo'")
+        );
         assert!(script.contains("--message 'Open the pane to review and respond.'"));
+        assert!(script.contains("--subtitle '~/sample-repo · w1:p3'"));
         assert!(script.contains("--group 'herdr-w1-p3'"));
         assert!(script.contains("--app-icon '/tmp/codex icon.png'"));
         assert!(script.contains("--actions 'Focus'"));
@@ -296,6 +310,23 @@ mod tests {
         );
 
         assert!(script.contains("--timeout 120"));
+    }
+
+    #[test]
+    fn alerter_script_omits_subtitle_when_there_is_none() {
+        let mut notification = sample_notification();
+        notification.subtitle = None;
+
+        let script = alerter_focus_script(
+            &notification,
+            "/usr/local/bin/herdr",
+            "/opt/homebrew/bin/alerter",
+            3600,
+            None,
+            Path::new("/tmp/herdr-focus-notify"),
+        );
+
+        assert!(!script.contains("--subtitle"));
     }
 
     #[test]

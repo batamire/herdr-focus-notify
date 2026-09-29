@@ -14,10 +14,13 @@ use std::env;
 use std::process::ExitCode;
 
 use cli::{parse_cli_args, print_usage, CliAction};
-use event::{focused_pane_id_from_event_json, notification_from_event_json, status_is_enabled};
+use event::{
+    enrich_notification, focused_pane_id_from_event_json, notification_from_event_json,
+    status_is_enabled,
+};
 use executable::resolve_herdr_bin;
 use focus::{
-    frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision,
+    frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision, pane_metadata,
     should_clear_notification_on_focus, test_notification, NotificationDecision,
 };
 use notifier::{remove_notification, resolve_notifier_bin, send_notification};
@@ -83,7 +86,7 @@ fn run() -> Result<(), String> {
 
     let herdr_bin = resolve_herdr_bin()?;
 
-    let notification = match action {
+    let mut notification = match action {
         CliAction::Test => test_notification(&herdr_bin),
         CliAction::Event => {
             let Ok(event_json) = env::var("HERDR_PLUGIN_EVENT_JSON") else {
@@ -131,6 +134,16 @@ fn run() -> Result<(), String> {
             unreachable!("handled before notification setup")
         }
     };
+
+    // Name the workspace, the work, and the directory: one glance tells the
+    // user which agent wants them without opening Herdr.
+    let metadata = pane_metadata(&notification.pane_id, &herdr_bin);
+    enrich_notification(
+        &mut notification,
+        metadata.workspace_label.as_deref(),
+        metadata.cwd.as_deref(),
+        metadata.terminal_title.as_deref(),
+    );
 
     if action != CliAction::Test && !status_is_enabled(&notification.status) {
         return Ok(());
