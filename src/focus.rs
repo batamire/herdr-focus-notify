@@ -37,6 +37,7 @@ struct AgentGetResult {
 struct AgentInfo {
     focused: bool,
     pane_id: Option<String>,
+    cwd: Option<String>,
     tab_id: Option<String>,
     terminal_title_stripped: Option<String>,
 }
@@ -99,6 +100,7 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
 /// Best-effort by design: every field stays empty when Herdr cannot answer,
 /// and the notification then falls back to the event's own message.
 pub(crate) struct PaneMetadata {
+    pub(crate) cwd: Option<String>,
     pub(crate) terminal_title: Option<String>,
     pub(crate) tab_label: Option<String>,
     pub(crate) workspace_label: Option<String>,
@@ -121,6 +123,7 @@ pub(crate) fn pane_metadata(pane_id: &str, herdr_bin: &str) -> PaneMetadata {
         .and_then(|json| tab_label_from_get_json(&json).ok().flatten());
 
     PaneMetadata {
+        cwd: pane.as_ref().and_then(|pane| pane.cwd.clone()),
         terminal_title: pane.and_then(|pane| pane.terminal_title),
         tab_label,
         workspace_label,
@@ -128,6 +131,7 @@ pub(crate) fn pane_metadata(pane_id: &str, herdr_bin: &str) -> PaneMetadata {
 }
 
 struct PaneDetails {
+    cwd: Option<String>,
     tab_id: Option<String>,
     terminal_title: Option<String>,
 }
@@ -140,6 +144,7 @@ fn pane_details_from_get_json(json: &str) -> Result<Option<PaneDetails>, String>
         .result
         .and_then(|result| result.agent)
         .map(|agent| PaneDetails {
+            cwd: agent.cwd,
             tab_id: agent.tab_id,
             terminal_title: agent.terminal_title_stripped,
         }))

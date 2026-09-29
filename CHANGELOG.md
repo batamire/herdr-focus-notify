@@ -6,7 +6,7 @@ All notable changes to `herdr-focus-notify` are documented here.
 
 ### Added
 
-- Notification text is laid out like the Agent sidebar's own rows: `{state} · {workspace label} · {tab label}` as the title, the agent as the alerter subtitle, and the pane's terminal title as the message. State and labels come from the event; workspace label, tab label, and terminal title come from `herdr workspace list`, `herdr agent get`, and `herdr tab get`. Panes Herdr cannot describe keep the previous status-specific copy.
+- Notification text is laid out like the Agent sidebar's own rows: `{state} · {workspace label} · {tab label}` as the title, the agent plus the pane's git state as the alerter subtitle, and the pane's terminal title as the message. The git state uses the short form shell prompts and diffstats share (`main* · +120/-45`): branch, a dirty marker, and lines inserted/deleted versus `HEAD`. Workspace label, tab label, terminal title, and cwd come from `herdr workspace list`, `herdr agent get`, and `herdr tab get`; the git state comes from `git status --porcelain --branch` and `git diff --numstat HEAD`, each bounded by a two-second timeout so a slow repository costs the git label instead of delaying the notification. Panes Herdr cannot describe keep the previous status-specific copy.
 
 ## [0.7.2] - 2026-09-26
 

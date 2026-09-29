@@ -2,6 +2,7 @@ mod cli;
 mod event;
 mod executable;
 mod focus;
+mod git;
 mod icons;
 mod notification;
 mod notifier;
@@ -138,11 +139,17 @@ fn run() -> Result<(), String> {
     // Name the workspace, the work, and the directory: one glance tells the
     // user which agent wants them without opening Herdr.
     let metadata = pane_metadata(&notification.pane_id, &herdr_bin);
+    let git_label = metadata
+        .cwd
+        .as_deref()
+        .and_then(git::git_summary)
+        .and_then(|summary| summary.label());
     enrich_notification(
         &mut notification,
         metadata.workspace_label.as_deref(),
         metadata.tab_label.as_deref(),
         metadata.terminal_title.as_deref(),
+        git_label.as_deref(),
     );
 
     if action != CliAction::Test && !status_is_enabled(&notification.status) {

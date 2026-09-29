@@ -117,15 +117,16 @@ fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {
 }
 
 /// Lays the notification out like the Agent sidebar's own rows: state, then
-/// workspace and tab in the title, the agent alone in the subtitle, and the
-/// pane's title as the message. Every input is optional, so a failed `herdr`
-/// call, or a pane Herdr cannot describe, leaves the event-only message in
-/// place.
+/// workspace and tab in the title, the agent (and the pane's git state) in the
+/// subtitle, and the pane's title as the message. Every input is optional, so a
+/// failed `herdr` call, or a pane Herdr cannot describe, leaves the event-only
+/// message in place.
 pub(crate) fn enrich_notification(
     notification: &mut FocusNotification,
     workspace_label: Option<&str>,
     tab_label: Option<&str>,
     terminal_title: Option<&str>,
+    git_label: Option<&str>,
 ) {
     for extra in [workspace_label, tab_label].into_iter().flatten() {
         if let Some(extra) = trimmed(Some(extra)) {
@@ -134,7 +135,13 @@ pub(crate) fn enrich_notification(
         }
     }
 
-    notification.subtitle = trimmed(Some(notification.agent.as_str())).map(str::to_string);
+    let subtitle = [Some(notification.agent.as_str()), git_label]
+        .into_iter()
+        .flatten()
+        .filter_map(|part| trimmed(Some(part)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    notification.subtitle = (!subtitle.is_empty()).then_some(subtitle);
 
     if let Some(task) = trimmed(terminal_title) {
         notification.body = task.to_string();
@@ -258,10 +265,14 @@ mod tests {
             Some(" sample-repo "),
             Some("status"),
             Some("Tidy up the parser tests"),
+            Some("main* +120/-45"),
         );
 
         assert_eq!(notification.title, "Blocked · sample-repo · status");
-        assert_eq!(notification.subtitle.as_deref(), Some("Codex"));
+        assert_eq!(
+            notification.subtitle.as_deref(),
+            Some("Codex · main* +120/-45")
+        );
         assert_eq!(notification.body, "Tidy up the parser tests");
     }
 
@@ -277,7 +288,7 @@ mod tests {
         }"#;
         let mut notification = notification_from_event_json(json).unwrap().unwrap();
 
-        enrich_notification(&mut notification, None, Some("  "), Some(""));
+        enrich_notification(&mut notification, None, Some("  "), Some(""), None);
 
         assert_eq!(notification.title, "Blocked");
         assert_eq!(notification.subtitle.as_deref(), Some("Codex"));
