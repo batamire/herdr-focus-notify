@@ -82,7 +82,7 @@ listen_on unix:/tmp/kitty
 
 In other terminals, or in kitty without these settings, the click only activates the terminal app, and macOS decides which window comes forward.
 
-Notifications name the pane they came from: the title is `{agent} {status} · {workspace label}`, the message is the pane's own terminal title (what that agent is working on), and the subtitle is the pane's directory and id. When Herdr reports no title, the message falls back to the status: blocked agents prompt you to review and respond, done agents prompt you to review the result. The plugin never reads or summarizes pane contents, and never asks Herdr to explain its detection.
+The notification is laid out like the Agent sidebar's own rows: the title is `{state} · {workspace} · {tab}`, the subtitle is the agent, and the message is the pane's terminal title. When Herdr reports no title, the message falls back to the status: blocked agents prompt you to review and respond, done agents prompt you to review the result. The plugin never reads or summarizes pane contents, and never asks Herdr to explain its detection.
 
 When you manually focus the matching pane in Herdr while its terminal is frontmost, its pending notification is removed.
 

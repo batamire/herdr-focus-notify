@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::executable::home_dir;
 use crate::icons::agent_icon_path;
 use crate::notification::FocusNotification;
 use crate::util::notification_group_id;
@@ -72,7 +71,7 @@ pub(crate) fn notification_from_event_json(
             .map(String::as_str),
     ]);
 
-    let title = format!("{agent} {status}");
+    let title = capitalize(&status);
     let body = detail
         .map(str::to_string)
         .unwrap_or_else(|| match status.as_str() {
@@ -85,6 +84,7 @@ pub(crate) fn notification_from_event_json(
     Ok(Some(FocusNotification {
         pane_id,
         status,
+        agent,
         title,
         body,
         subtitle: None,
@@ -116,38 +116,43 @@ fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {
         .find(|value| !value.is_empty())
 }
 
-/// Names the workspace and the work in the notification. Every input is
-/// optional, so a failed `herdr` call leaves the event-only message in place.
+/// Lays the notification out like the Agent sidebar's own rows: state, then
+/// workspace and tab in the title, the agent alone in the subtitle, and the
+/// pane's title as the message. Every input is optional, so a failed `herdr`
+/// call, or a pane Herdr cannot describe, leaves the event-only message in
+/// place.
 pub(crate) fn enrich_notification(
     notification: &mut FocusNotification,
     workspace_label: Option<&str>,
-    cwd: Option<&str>,
+    tab_label: Option<&str>,
     terminal_title: Option<&str>,
 ) {
-    if let Some(label) = trimmed(workspace_label) {
-        notification.title = format!("{} · {label}", notification.title);
+    for extra in [workspace_label, tab_label].into_iter().flatten() {
+        if let Some(extra) = trimmed(Some(extra)) {
+            notification.title.push_str(" · ");
+            notification.title.push_str(extra);
+        }
     }
+
+    notification.subtitle = trimmed(Some(notification.agent.as_str())).map(str::to_string);
+
     if let Some(task) = trimmed(terminal_title) {
         notification.body = task.to_string();
     }
-
-    let mut parts = Vec::new();
-    if let Some(cwd) = trimmed(cwd) {
-        parts.push(abbreviate_home(cwd));
-    }
-    parts.push(notification.pane_id.clone());
-    notification.subtitle = Some(parts.join(" · "));
 }
 
 fn trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// `$HOME` becomes `~`, so a long path still fits the one-line subtitle.
-fn abbreviate_home(path: &str) -> String {
-    match home_dir().and_then(|home| path.strip_prefix(home.to_str()?).map(str::to_string)) {
-        Some(rest) => format!("~{rest}"),
-        None => path.to_string(),
+/// Herdr renders the state as an icon in the sidebar and words it lower-case
+/// in `state_text`; a notification headline starts with it, so the first
+/// letter is raised.
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -174,7 +179,8 @@ mod tests {
 
         assert_eq!(notification.pane_id, "w1:p3");
         assert_eq!(notification.status, "blocked");
-        assert_eq!(notification.title, "Codex blocked");
+        assert_eq!(notification.agent, "Codex");
+        assert_eq!(notification.title, "Blocked");
         assert_eq!(notification.body, "Implement plugin");
         assert_eq!(notification.subtitle, None);
         assert_eq!(notification.group, "herdr-w1-p3");
@@ -199,7 +205,7 @@ mod tests {
         let notification = notification_from_event_json(json).unwrap().unwrap();
 
         assert_eq!(notification.status, "done");
-        assert_eq!(notification.title, "Codex done");
+        assert_eq!(notification.title, "Done");
         assert_eq!(notification.body, "Implement plugin");
         assert!(notification.app_icon.is_some());
     }
@@ -216,7 +222,7 @@ mod tests {
 
         let notification = notification_from_event_json(json).unwrap().unwrap();
 
-        assert_eq!(notification.title, "Codex blocked");
+        assert_eq!(notification.title, "Blocked");
         assert_eq!(notification.body, "Open the pane to review and respond.");
     }
 
@@ -237,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn enrichment_names_workspace_task_and_pane_directory() {
+    fn enrichment_lays_out_title_subtitle_and_message_like_the_sidebar() {
         let json = r#"{
             "data": {
                 "pane_id": "w1:p3",
@@ -250,16 +256,13 @@ mod tests {
         enrich_notification(
             &mut notification,
             Some(" sample-repo "),
-            Some("/tmp/sample-repo"),
+            Some("status"),
             Some("Tidy up the parser tests"),
         );
 
-        assert_eq!(notification.title, "Codex blocked · sample-repo");
+        assert_eq!(notification.title, "Blocked · sample-repo · status");
+        assert_eq!(notification.subtitle.as_deref(), Some("Codex"));
         assert_eq!(notification.body, "Tidy up the parser tests");
-        assert_eq!(
-            notification.subtitle.as_deref(),
-            Some("/tmp/sample-repo · w1:p3")
-        );
     }
 
     #[test]
@@ -274,11 +277,11 @@ mod tests {
         }"#;
         let mut notification = notification_from_event_json(json).unwrap().unwrap();
 
-        enrich_notification(&mut notification, None, Some(""), Some("  "));
+        enrich_notification(&mut notification, None, Some("  "), Some(""));
 
-        assert_eq!(notification.title, "Codex blocked");
+        assert_eq!(notification.title, "Blocked");
+        assert_eq!(notification.subtitle.as_deref(), Some("Codex"));
         assert_eq!(notification.body, "Implement plugin");
-        assert_eq!(notification.subtitle.as_deref(), Some("w1:p3"));
     }
 
     #[test]

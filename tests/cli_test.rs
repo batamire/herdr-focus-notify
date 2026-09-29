@@ -243,7 +243,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     let herdr = temp_dir.join("herdr");
     write_executable(
         &herdr,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$2\" = \"get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"cwd\":\"/tmp/sample-repo\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1 $2\" = \"agent get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"tab_id\":\"w1:t7\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"tab get\" ]; then\n  printf '%s\\n' '{\"result\":{\"tab\":{\"label\":\"status\",\"number\":7}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
     );
 
     let notifier = temp_dir.join("alerter");
@@ -281,10 +281,10 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    assert!(notifier_output.contains("Codex blocked · sample-repo"));
+    assert!(notifier_output.contains("Blocked · sample-repo · status"));
+    assert!(notifier_output.contains("Codex\n"));
     assert!(notifier_output.contains("Tidy up the parser tests"));
     assert!(notifier_output.contains("--subtitle"));
-    assert!(notifier_output.contains("/tmp/sample-repo · w1:p2"));
     assert!(!fs::read_to_string(&herdr_log)
         .unwrap_or_default()
         .contains("explain"));

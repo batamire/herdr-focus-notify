@@ -141,7 +141,7 @@ fn run() -> Result<(), String> {
     enrich_notification(
         &mut notification,
         metadata.workspace_label.as_deref(),
-        metadata.cwd.as_deref(),
+        metadata.tab_label.as_deref(),
         metadata.terminal_title.as_deref(),
     );
 

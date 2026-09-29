@@ -37,8 +37,23 @@ struct AgentGetResult {
 struct AgentInfo {
     focused: bool,
     pane_id: Option<String>,
-    cwd: Option<String>,
+    tab_id: Option<String>,
     terminal_title_stripped: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabGetEnvelope {
+    result: Option<TabGetResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabGetResult {
+    tab: Option<TabInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabInfo {
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +84,7 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
     FocusNotification {
         pane_id: pane_id.clone(),
         status: "blocked".to_string(),
+        agent: "Test".to_string(),
         title: "Focus notification test".to_string(),
         body: "Click to return to this Herdr pane.".to_string(),
         subtitle: None,
@@ -77,20 +93,20 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
     }
 }
 
-/// Pane details a status event does not carry: what the pane is working on,
-/// where, and which workspace it belongs to.
+/// The pane's own row of the Agent sidebar: what it is working on, which tab
+/// holds it, and which workspace that tab belongs to.
 ///
-/// Best-effort by design: any field stays empty when Herdr cannot answer, and
-/// the notification then falls back to the event's own message.
+/// Best-effort by design: every field stays empty when Herdr cannot answer,
+/// and the notification then falls back to the event's own message.
 pub(crate) struct PaneMetadata {
-    pub(crate) cwd: Option<String>,
     pub(crate) terminal_title: Option<String>,
+    pub(crate) tab_label: Option<String>,
     pub(crate) workspace_label: Option<String>,
 }
 
 pub(crate) fn pane_metadata(pane_id: &str, herdr_bin: &str) -> PaneMetadata {
-    let agent = command_stdout(herdr_bin, &["agent", "get", pane_id])
-        .and_then(|json| agent_metadata_from_get_json(&json).ok().flatten());
+    let pane = command_stdout(herdr_bin, &["agent", "get", pane_id])
+        .and_then(|json| pane_details_from_get_json(&json).ok().flatten());
 
     let workspace = crate::util::workspace_id_from_pane_id(pane_id).unwrap_or("default");
     let workspace_label = command_stdout(herdr_bin, &["workspace", "list"]).and_then(|json| {
@@ -98,30 +114,45 @@ pub(crate) fn pane_metadata(pane_id: &str, herdr_bin: &str) -> PaneMetadata {
             .ok()
             .flatten()
     });
+    let tab_label = pane
+        .as_ref()
+        .and_then(|pane| pane.tab_id.as_deref())
+        .and_then(|tab_id| command_stdout(herdr_bin, &["tab", "get", tab_id]))
+        .and_then(|json| tab_label_from_get_json(&json).ok().flatten());
 
     PaneMetadata {
-        cwd: agent.as_ref().and_then(|meta| meta.cwd.clone()),
-        terminal_title: agent.and_then(|meta| meta.terminal_title),
+        terminal_title: pane.and_then(|pane| pane.terminal_title),
+        tab_label,
         workspace_label,
     }
 }
 
-struct AgentMetadata {
-    cwd: Option<String>,
+struct PaneDetails {
+    tab_id: Option<String>,
     terminal_title: Option<String>,
 }
 
-fn agent_metadata_from_get_json(json: &str) -> Result<Option<AgentMetadata>, String> {
+fn pane_details_from_get_json(json: &str) -> Result<Option<PaneDetails>, String> {
     let envelope: AgentGetEnvelope =
         serde_json::from_str(json).map_err(|err| format!("invalid agent get json: {err}"))?;
 
     Ok(envelope
         .result
         .and_then(|result| result.agent)
-        .map(|agent| AgentMetadata {
-            cwd: agent.cwd,
+        .map(|agent| PaneDetails {
+            tab_id: agent.tab_id,
             terminal_title: agent.terminal_title_stripped,
         }))
+}
+
+fn tab_label_from_get_json(json: &str) -> Result<Option<String>, String> {
+    let envelope: TabGetEnvelope =
+        serde_json::from_str(json).map_err(|err| format!("invalid tab get json: {err}"))?;
+
+    Ok(envelope
+        .result
+        .and_then(|result| result.tab)
+        .and_then(|tab| tab.label))
 }
 
 fn workspace_label_from_list_json(
@@ -442,16 +473,30 @@ mod tests {
     #[test]
     fn reads_pane_metadata_from_agent_get_json() {
         let json = r#"{"result":{"agent":{"focused":false,"pane_id":"w1:p3",
-            "cwd":"/Users/me/sample-repo","terminal_title_stripped":"Tidy up the parser tests"}}}"#;
+            "tab_id":"w1:t7","terminal_title_stripped":"Tidy up the parser tests"}}}"#;
 
-        let metadata = agent_metadata_from_get_json(json).unwrap().unwrap();
+        let details = pane_details_from_get_json(json).unwrap().unwrap();
 
-        assert_eq!(metadata.cwd.as_deref(), Some("/Users/me/sample-repo"));
+        assert_eq!(details.tab_id.as_deref(), Some("w1:t7"));
         assert_eq!(
-            metadata.terminal_title.as_deref(),
+            details.terminal_title.as_deref(),
             Some("Tidy up the parser tests")
         );
-        assert!(agent_metadata_from_get_json("not json").is_err());
+        assert!(pane_details_from_get_json("not json").is_err());
+    }
+
+    #[test]
+    fn reads_the_tab_label_from_tab_get_json() {
+        let json = r#"{"result":{"tab":{"label":"status","number":7}}}"#;
+
+        assert_eq!(
+            tab_label_from_get_json(json).unwrap().as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            tab_label_from_get_json(r#"{"result":{"tab":{"number":7}}}"#).unwrap(),
+            None
+        );
     }
 
     #[test]

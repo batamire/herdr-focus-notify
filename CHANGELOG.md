@@ -6,7 +6,7 @@ All notable changes to `herdr-focus-notify` are documented here.
 
 ### Added
 
-- Notification text identifies the pane: `{agent} {status} · {workspace label}` as the title, the pane's terminal title as the message, and `{cwd} · {pane id}` as the alerter subtitle (`--subtitle`). Panes Herdr cannot describe keep the previous status-specific copy.
+- Notification text is laid out like the Agent sidebar's own rows: `{state} · {workspace label} · {tab label}` as the title, the agent as the alerter subtitle, and the pane's terminal title as the message. State and labels come from the event; workspace label, tab label, and terminal title come from `herdr workspace list`, `herdr agent get`, and `herdr tab get`. Panes Herdr cannot describe keep the previous status-specific copy.
 
 ## [0.7.2] - 2026-09-26
 

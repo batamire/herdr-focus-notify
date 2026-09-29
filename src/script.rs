@@ -258,9 +258,10 @@ mod tests {
         FocusNotification {
             pane_id: "w1:p3".to_string(),
             status: "blocked".to_string(),
-            title: "Codex blocked · sample-repo".to_string(),
+            agent: "Codex".to_string(),
+            title: "Blocked · sample-repo · status".to_string(),
             body: "Open the pane to review and respond.".to_string(),
-            subtitle: Some("~/sample-repo · w1:p3".to_string()),
+            subtitle: Some("Codex".to_string()),
             group: "herdr-w1-p3".to_string(),
             app_icon: Some("/tmp/codex icon.png".to_string()),
         }
@@ -279,10 +280,10 @@ mod tests {
 
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(
-            script.contains("'/opt/homebrew/bin/alerter' --title 'Codex blocked · sample-repo'")
+            script.contains("'/opt/homebrew/bin/alerter' --title 'Blocked · sample-repo · status'")
         );
         assert!(script.contains("--message 'Open the pane to review and respond.'"));
-        assert!(script.contains("--subtitle '~/sample-repo · w1:p3'"));
+        assert!(script.contains("--subtitle 'Codex'"));
         assert!(script.contains("--group 'herdr-w1-p3'"));
         assert!(script.contains("--app-icon '/tmp/codex icon.png'"));
         assert!(script.contains("--actions 'Focus'"));
