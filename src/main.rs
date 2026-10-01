@@ -21,9 +21,11 @@ use event::{
 };
 use executable::resolve_herdr_bin;
 use focus::{
-    frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision, pane_metadata,
-    should_clear_notification_on_focus, test_notification, NotificationDecision,
+    frontmost_bundle_id, learn_terminal_from_frontmost, notification_decision, pane_details,
+    pane_row, should_clear_notification_on_focus, test_notification, worktree_branch,
+    NotificationDecision, PaneDetails,
 };
+use notification::FocusNotification;
 use notifier::{remove_notification, resolve_notifier_bin, send_notification};
 use script::{rewrite_generated_scripts_without_activation, write_focus_script};
 use state::{
@@ -77,7 +79,8 @@ fn run() -> Result<(), String> {
         }
         CliAction::CheckPaneVisibility(pane_id) => {
             let herdr_bin = resolve_herdr_bin()?;
-            if notification_decision(&pane_id, &herdr_bin) == NotificationDecision::Skip {
+            let focused = pane_details(&pane_id, &herdr_bin).is_some_and(|details| details.focused);
+            if notification_decision(&pane_id, focused) == NotificationDecision::Skip {
                 return Ok(());
             }
             return Err("pane is not visible in its workspace's bound terminal".to_string());
@@ -136,27 +139,20 @@ fn run() -> Result<(), String> {
         }
     };
 
-    // Name the workspace, the work, and the directory: one glance tells the
-    // user which agent wants them without opening Herdr.
-    let metadata = pane_metadata(&notification.pane_id, &herdr_bin);
-    let git_label = metadata
-        .cwd
-        .as_deref()
-        .and_then(git::git_summary)
-        .and_then(|summary| summary.label());
-    enrich_notification(
-        &mut notification,
-        metadata.workspace_label.as_deref(),
-        metadata.tab_label.as_deref(),
-        metadata.terminal_title.as_deref(),
-        git_label.as_deref(),
-    );
-
+    // A status the user does not want to hear about costs nothing beyond the
+    // event itself.
     if action != CliAction::Test && !status_is_enabled(&notification.status) {
         return Ok(());
     }
 
-    let mut notification_decision = notification_decision(&notification.pane_id, &herdr_bin);
+    // One `herdr agent get` answers both questions below: whether the user is
+    // already looking at this pane, and what the pane is working on. The skip
+    // decision runs before the remaining Herdr and git calls, because a
+    // suppressed notification must not pay for them.
+    let details = pane_details(&notification.pane_id, &herdr_bin);
+    let focused = details.as_ref().is_some_and(|details| details.focused);
+
+    let mut notification_decision = notification_decision(&notification.pane_id, focused);
     if notification_decision == NotificationDecision::Skip {
         if action == CliAction::Test {
             // When enabled, --test validates the pipeline end to end, so it
@@ -166,6 +162,10 @@ fn run() -> Result<(), String> {
         } else {
             return Ok(());
         }
+    }
+
+    if action != CliAction::Test {
+        enrich_from_pane(&mut notification, details.as_ref(), &herdr_bin);
     }
 
     reset_notification_clearance(&notification.pane_id)
@@ -185,4 +185,32 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("failed to send notification: {err}"))?;
 
     Ok(())
+}
+
+/// Names the workspace, the tab, the terminal title, and the pane's git state on
+/// a notification that is going to be shown.
+///
+/// `--test` deliberately keeps its own copy: it describes the plugin rather than
+/// a pane, and it is the text a user reads while checking their setup against
+/// what they expect to see.
+fn enrich_from_pane(
+    notification: &mut FocusNotification,
+    details: Option<&PaneDetails>,
+    herdr_bin: &str,
+) {
+    let metadata = pane_row(&notification.pane_id, details, herdr_bin);
+    let git_label = metadata.cwd.as_deref().and_then(|cwd| {
+        git::label(
+            worktree_branch(cwd, herdr_bin).as_deref(),
+            git::changed_lines(cwd),
+        )
+    });
+
+    enrich_notification(
+        notification,
+        metadata.workspace_label.as_deref(),
+        metadata.tab_label.as_deref(),
+        metadata.terminal_title.as_deref(),
+        git_label.as_deref(),
+    );
 }

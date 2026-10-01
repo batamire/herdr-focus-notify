@@ -243,7 +243,17 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     let herdr = temp_dir.join("herdr");
     write_executable(
         &herdr,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1 $2\" = \"agent get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"tab_id\":\"w1:t7\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"tab get\" ]; then\n  printf '%s\\n' '{\"result\":{\"tab\":{\"label\":\"status\",\"number\":7}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1 $2\" = \"agent get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"cwd\":\"/worktrees/api/src\",\"tab_id\":\"w1:t7\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"tab get\" ]; then\n  printf '%s\\n' '{\"result\":{\"tab\":{\"label\":\"status\",\"number\":7}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nelif [ \"$1 $2\" = \"worktree list\" ]; then\n  printf '%s\\n' '{\"result\":{\"source\":{\"repo_root\":\"/repo\",\"source_checkout_path\":\"/repo\"},\"worktrees\":[{\"branch\":\"main\",\"is_detached\":false,\"path\":\"/repo\"},{\"branch\":\"feature/api\",\"is_detached\":false,\"path\":\"/worktrees/api\"}]}}'\nfi\n",
+    );
+
+    // The git probe is faked as well, so the test can hold the two properties
+    // that keep it from interfering with an agent working in the same
+    // repository: it never takes the index lock, and it parses a summary line
+    // git is forced to print in English.
+    let git = temp_dir.join("git");
+    write_executable(
+        &git,
+        "#!/bin/sh\nprintf '%s LC_ALL=%s\\n' \"$*\" \"$LC_ALL\" >> \"$GIT_LOG\"\nprintf ' 2 files changed, 4 insertions(+), 4 deletions(-)\\n'\n",
     );
 
     let notifier = temp_dir.join("alerter");
@@ -254,6 +264,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
 
     let notifier_log = temp_dir.join("notifier.log");
     let herdr_log = temp_dir.join("herdr.log");
+    let git_log = temp_dir.join("git.log");
     let path = path_with_temp_dir(&temp_dir);
     let output = binary()
         .env("HERDR_PLUGIN_EVENT", "pane.agent_status_changed")
@@ -265,6 +276,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
         .env("HERDR_PLUGIN_STATE_DIR", temp_dir.join("state"))
         .env("NOTIFIER_LOG", &notifier_log)
         .env("HERDR_LOG", &herdr_log)
+        .env("GIT_LOG", &git_log)
         .env("PATH", path)
         .output()
         .unwrap();
@@ -282,9 +294,19 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     }
 
     assert!(notifier_output.contains("Blocked · sample-repo · status"));
-    assert!(notifier_output.contains("Codex\n"));
+    // The pane's terminal title is the message; the event's own title is not
+    // shown next to it.
     assert!(notifier_output.contains("Tidy up the parser tests"));
+    assert!(!notifier_output.contains("Implement plugin"));
     assert!(notifier_output.contains("--subtitle"));
+    // The pane sits in a linked worktree, so the branch is that worktree's —
+    // not the `main` of the checkout Herdr reports as the source.
+    assert!(notifier_output.contains("Codex · feature/api* · +4/-4"));
+    // The counts must come from a probe that leaves the index alone and cannot
+    // be confused by a translated git.
+    let git_log = fs::read_to_string(&git_log).unwrap_or_default();
+    assert!(git_log.contains("--no-optional-locks"), "{git_log}");
+    assert!(git_log.contains("LC_ALL=C"), "{git_log}");
     assert!(!fs::read_to_string(&herdr_log)
         .unwrap_or_default()
         .contains("explain"));

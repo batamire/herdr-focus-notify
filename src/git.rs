@@ -1,204 +1,169 @@
-//! The git facts a notification shows next to the agent: which branch the
-//! pane's directory is on, whether the tree is dirty, and how many lines it
-//! changed versus `HEAD`.
+//! How much the pane's directory has changed versus `HEAD`.
 //!
-//! Herdr's Agent sidebar gets its `branch` and `git_status` tokens from the
-//! client, not from the socket API (`branch` is only exposed on worktrees), so
-//! a notification has to ask git itself.
+//! The branch next to these counts comes from Herdr's own `worktree list`,
+//! not from here: it is the same source the Agent sidebar uses, and it still
+//! answers for a repository that has no commits yet, where `git status` reports
+//! `## No commits yet on main` instead of a branch name.
 
-use std::fmt::Write;
 use std::time::Duration;
 
 use crate::util::command_stdout_with_timeout;
 
-/// Ceiling on one git call, so a pathological repository delays a notification
+/// Ceiling on the git call, so a pathological repository delays a notification
 /// instead of stalling the event hook that produces it.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) struct GitSummary {
-    pub(crate) branch: Option<String>,
-    /// Tracked files differ from `HEAD`. Untracked files are not counted, so
-    /// the marker and the line counts describe the same set of changes.
-    pub(crate) dirty: bool,
-    /// Insertions and deletions versus `HEAD`; None when git cannot answer.
-    pub(crate) changed_lines: Option<(usize, usize)>,
-}
+/// Longest branch the subtitle shows before it is middle-truncated. macOS gives
+/// the subtitle a single line and truncates its end, so an untruncated branch
+/// would push the line counts out of view — the numbers are the part that
+/// cannot be guessed from the branch name.
+const MAX_BRANCH_CHARS: usize = 24;
 
-impl GitSummary {
-    /// The short form shell prompts and diffstats share, joined with the same
-    /// separator the sidebar rows use: `main* · +120/-45`.
-    ///
-    /// None when there is nothing worth showing, so a directory that is not a
-    /// repository, or a detached `HEAD`, adds nothing to the notification.
-    pub(crate) fn label(&self) -> Option<String> {
-        let mut label = String::new();
-        if let Some(branch) = self.branch.as_deref() {
-            label.push_str(branch);
-            if self.dirty {
-                label.push('*');
-            }
-        }
+/// Characters kept from the head of a truncated branch. The head identifies the
+/// work (`feature/…`), the tail separates siblings (`…-layout`).
+const BRANCH_HEAD_CHARS: usize = 12;
 
-        if let Some((inserted, deleted)) = self.changed_lines {
-            if inserted > 0 || deleted > 0 {
-                if !label.is_empty() {
-                    label.push_str(" · ");
-                }
-                let _ = write!(label, "+{inserted}/-{deleted}");
-            }
-        }
-
-        (!label.is_empty()).then_some(label)
-    }
-}
-
-/// Best-effort: None when `cwd` is not in a repository, or when git cannot be
-/// run at all, which is what keeps a notification working on a bare machine.
+/// The git state a notification shows for a pane's directory, in the short form
+/// shell prompts and diffstats share: `main* · +120/-45`.
 ///
-/// Both calls are bounded by `GIT_TIMEOUT`; a repository slow enough to hit it
-/// contributes no git label rather than a late notification.
-pub(crate) fn git_summary(cwd: &str) -> Option<GitSummary> {
-    let status = command_stdout_with_timeout(
+/// None when there is no branch to attribute the changes to. A detached `HEAD`
+/// or a directory outside a repository contributes nothing rather than a bare
+/// `+120/-45` that explains neither where nor what.
+pub(crate) fn label(branch: Option<&str>, changed_lines: Option<(usize, usize)>) -> Option<String> {
+    let branch = display_branch(branch?);
+    let (inserted, deleted) = changed_lines.unwrap_or((0, 0));
+
+    if inserted == 0 && deleted == 0 {
+        return Some(branch);
+    }
+
+    Some(format!("{branch}* · +{inserted}/-{deleted}"))
+}
+
+/// Insertions and deletions versus `HEAD`; None when git cannot answer, which
+/// is the same best-effort contract the rest of the enrichment follows.
+///
+/// Counts cover tracked changes only, so the `*` marker and the numbers always
+/// describe the same set of changes, and they are not a branch's total: work
+/// the pane has already committed shows no counts.
+pub(crate) fn changed_lines(cwd: &str) -> Option<(usize, usize)> {
+    // `--no-optional-locks` keeps the probe from refreshing the index. Git
+    // takes `.git/index.lock` to do that, and a notification fires exactly when
+    // an agent is likely to be running git in the same repository.
+    //
+    // `LC_ALL=C` keeps the summary line parseable: git translates it, and a
+    // translated `Dateien geändert` carries no `(+)`/`(-)` suffix to key on.
+    let shortstat = command_stdout_with_timeout(
         "git",
         &[
+            "--no-optional-locks",
             "-C",
             cwd,
-            "status",
-            "--porcelain",
-            "--branch",
-            "--untracked-files=no",
+            "diff",
+            "--shortstat",
+            "HEAD",
         ],
+        &[("LC_ALL", "C")],
         GIT_TIMEOUT,
     )?;
-    let (branch, dirty) = branch_and_dirty_from_status(&status);
-    // Versus HEAD, so this is what the pane has changed and not committed.
-    // A repository without commits yet has no HEAD; the counts are then
-    // simply unknown.
-    let changed_lines = command_stdout_with_timeout(
-        "git",
-        &["-C", cwd, "diff", "--numstat", "HEAD"],
-        GIT_TIMEOUT,
-    )
-    .map(|numstat| changed_lines_from_numstat(&numstat));
 
-    let summary = GitSummary {
-        branch,
-        dirty,
-        changed_lines,
-    };
-
-    summary.label()?;
-    Some(summary)
+    Some(changed_lines_from_shortstat(&shortstat))
 }
 
-/// `## main...origin/main [ahead 1]` / `## main [ahead 1]` / `## HEAD (no branch)`.
-fn branch_and_dirty_from_status(status: &str) -> (Option<String>, bool) {
-    let mut lines = status.lines();
-    let branch = lines
-        .next()
-        .and_then(|line| line.strip_prefix("## "))
-        .and_then(branch_from_status_line);
+/// ` 3 files changed, 12 insertions(+), 4 deletions(-)`, one clause per kind of
+/// count, and either clause is left out when its count is zero. The counts are
+/// keyed on the `(+)`/`(-)` suffixes rather than the words, which are
+/// pluralized (`1 insertion(+)`) and translated.
+fn changed_lines_from_shortstat(shortstat: &str) -> (usize, usize) {
+    shortstat
+        .split(',')
+        .fold((0, 0), |(inserted, deleted), clause| {
+            let clause = clause.trim();
+            let count = clause
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<usize>().ok());
 
-    // Every remaining line is one changed path.
-    (branch, lines.next().is_some())
-}
-
-fn branch_from_status_line(line: &str) -> Option<String> {
-    // Drop the upstream (`...origin/main`) and any `[ahead 1, behind 2]` part.
-    let name = line
-        .split("...")
-        .next()
-        .unwrap_or(line)
-        .split(' ')
-        .next()
-        .unwrap_or(line)
-        .trim();
-
-    // A detached HEAD has no branch name to show.
-    if name.is_empty() || name == "HEAD" {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// Sums `<inserted>\t<deleted>\t<path>` lines. Binary files report `-` and add
-/// nothing.
-fn changed_lines_from_numstat(numstat: &str) -> (usize, usize) {
-    numstat.lines().fold((0, 0), |(inserted, deleted), line| {
-        let mut fields = line.split('\t');
-        match (
-            fields.next().and_then(|value| value.parse::<usize>().ok()),
-            fields.next().and_then(|value| value.parse::<usize>().ok()),
-        ) {
-            (Some(line_inserted), Some(line_deleted)) => {
-                (inserted + line_inserted, deleted + line_deleted)
+            match count {
+                Some(count) if clause.ends_with("(+)") => (inserted + count, deleted),
+                Some(count) if clause.ends_with("(-)") => (inserted, deleted + count),
+                _ => (inserted, deleted),
             }
-            _ => (inserted, deleted),
-        }
-    })
+        })
+}
+
+/// Middle-truncates a branch too long for the subtitle's one line.
+///
+/// Counted in `chars`, not bytes: slicing a branch with a non-ASCII character
+/// at a byte offset would panic.
+fn display_branch(branch: &str) -> String {
+    let chars: Vec<char> = branch.chars().collect();
+    if chars.len() <= MAX_BRANCH_CHARS {
+        return branch.to_string();
+    }
+
+    // One of the budgeted characters is the ellipsis.
+    let tail_chars = MAX_BRANCH_CHARS - BRANCH_HEAD_CHARS - 1;
+    let mut truncated: String = chars[..BRANCH_HEAD_CHARS].iter().collect();
+    truncated.push('…');
+    truncated.extend(&chars[chars.len() - tail_chars..]);
+    truncated
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn summary(branch: Option<&str>, dirty: bool, lines: Option<(usize, usize)>) -> GitSummary {
-        GitSummary {
-            branch: branch.map(str::to_string),
-            dirty,
-            changed_lines: lines,
-        }
-    }
-
     #[test]
     fn labels_branch_dirty_marker_and_line_counts_like_a_prompt_does() {
         assert_eq!(
-            summary(Some("main"), true, Some((120, 45)))
-                .label()
-                .as_deref(),
+            label(Some("main"), Some((120, 45))).as_deref(),
             Some("main* · +120/-45")
         );
         assert_eq!(
-            summary(Some("feature/api"), false, Some((3, 0)))
-                .label()
-                .as_deref(),
-            Some("feature/api · +3/-0")
+            label(Some("feature/api"), Some((3, 0))).as_deref(),
+            Some("feature/api* · +3/-0")
         );
         // A clean tree carries neither marker nor counts.
-        assert_eq!(
-            summary(Some("main"), false, Some((0, 0)))
-                .label()
-                .as_deref(),
-            Some("main")
-        );
-        assert_eq!(summary(None, false, None).label(), None);
+        assert_eq!(label(Some("main"), Some((0, 0))).as_deref(), Some("main"));
+        assert_eq!(label(Some("main"), None).as_deref(), Some("main"));
+        // Nothing to attribute the changes to, so nothing to show.
+        assert_eq!(label(None, Some((120, 45))), None);
+        assert_eq!(label(None, None), None);
     }
 
     #[test]
-    fn reads_branch_and_dirty_from_status() {
-        let (branch, dirty) = branch_and_dirty_from_status("## main...origin/main [ahead 1]\n");
-        assert_eq!(branch.as_deref(), Some("main"));
-        assert!(!dirty);
-
-        let (branch, dirty) = branch_and_dirty_from_status("## main [ahead 1]\n M src/lib.rs\n");
-        assert_eq!(branch.as_deref(), Some("main"));
-        assert!(dirty);
-
-        // Detached HEAD has no branch name, but changes still count.
-        let (branch, dirty) = branch_and_dirty_from_status("## HEAD (no branch)\n M a.txt\n");
-        assert_eq!(branch, None);
-        assert!(dirty);
-
-        assert_eq!(branch_and_dirty_from_status("").0, None);
+    fn middle_truncates_a_long_branch_to_keep_the_counts_on_the_line() {
+        assert_eq!(display_branch("main"), "main");
+        assert_eq!(display_branch("feature/JIRA-123-authentication-layout"), {
+            let truncated = "feature/JIRA…tion-layout";
+            assert_eq!(truncated.chars().count(), MAX_BRANCH_CHARS);
+            truncated
+        });
+        // Counted in chars: a multi-byte branch must not panic on a slice.
+        let long_unicode = "feature/ünicode-branch-name-that-is-long";
+        assert_eq!(
+            display_branch(long_unicode).chars().count(),
+            MAX_BRANCH_CHARS
+        );
     }
 
     #[test]
-    fn sums_numstat_and_skips_binary_files() {
+    fn sums_shortstat_by_its_count_suffixes() {
         assert_eq!(
-            changed_lines_from_numstat("12\t3\tsrc/a.rs\n-\t-\tassets/logo.png\n8\t0\tsrc/b.rs\n"),
-            (20, 3)
+            changed_lines_from_shortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)"),
+            (12, 4)
         );
-        assert_eq!(changed_lines_from_numstat(""), (0, 0));
+        // Pluralization varies, and either clause is omitted at zero.
+        assert_eq!(
+            changed_lines_from_shortstat(" 1 file changed, 1 insertion(+)"),
+            (1, 0)
+        );
+        assert_eq!(
+            changed_lines_from_shortstat(" 2 files changed, 5 deletions(-)"),
+            (0, 5)
+        );
+        // A clean tree prints nothing at all.
+        assert_eq!(changed_lines_from_shortstat(""), (0, 0));
     }
 }

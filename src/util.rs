@@ -16,16 +16,19 @@ pub(crate) fn command_stdout(bin: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Like `command_stdout`, but kills the command once `timeout` has passed and
-/// reports None. `Command` has no timeout of its own, so the child is polled
-/// until the deadline; stdout is drained on another thread because a command
-/// that fills the pipe buffer before it exits would otherwise deadlock.
+/// reports None, and with `env` added to the child's environment. `Command` has
+/// no timeout of its own, so the child is polled until the deadline; stdout is
+/// drained on another thread because a command that fills the pipe buffer
+/// before it exits would otherwise deadlock.
 pub(crate) fn command_stdout_with_timeout(
     bin: &str,
     args: &[&str],
+    env: &[(&str, &str)],
     timeout: Duration,
 ) -> Option<String> {
     let mut child = Command::new(bin)
         .args(args)
+        .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -102,17 +105,33 @@ mod tests {
 
     #[test]
     fn bounded_command_returns_output_when_it_finishes_in_time() {
-        let stdout =
-            command_stdout_with_timeout("sh", &["-c", "printf 'hello'"], Duration::from_secs(5));
+        let stdout = command_stdout_with_timeout(
+            "sh",
+            &["-c", "printf 'hello'"],
+            &[],
+            Duration::from_secs(5),
+        );
 
         assert_eq!(stdout.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn bounded_command_passes_its_environment_through() {
+        let stdout = command_stdout_with_timeout(
+            "sh",
+            &["-c", "printf '%s' \"$LC_ALL\""],
+            &[("LC_ALL", "C")],
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(stdout.as_deref(), Some("C"));
     }
 
     #[test]
     fn bounded_command_gives_up_and_reports_none_when_it_overruns() {
         let started = Instant::now();
         let stdout =
-            command_stdout_with_timeout("sh", &["-c", "sleep 30"], Duration::from_millis(200));
+            command_stdout_with_timeout("sh", &["-c", "sleep 30"], &[], Duration::from_millis(200));
 
         assert_eq!(stdout, None);
         assert!(started.elapsed() < Duration::from_secs(5));
