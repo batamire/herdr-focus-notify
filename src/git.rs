@@ -5,17 +5,13 @@
 //! answers for a repository that has no commits yet, where `git status` reports
 //! `## No commits yet on main` instead of a branch name.
 
-use std::time::Duration;
+use std::time::Instant;
 
-use crate::util::command_stdout_with_timeout;
-
-/// Ceiling on the git call, so a pathological repository delays a notification
-/// instead of stalling the event hook that produces it.
-const GIT_TIMEOUT: Duration = Duration::from_secs(2);
+use crate::util::command_stdout_until;
 
 /// Longest branch the subtitle shows before it is middle-truncated. macOS gives
 /// the subtitle a single line and truncates its end, so an untruncated branch
-/// would push the line counts out of view — the numbers are the part that
+/// would push the line counts out of view, and the numbers are the part that
 /// cannot be guessed from the branch name.
 const MAX_BRANCH_CHARS: usize = 24;
 
@@ -38,39 +34,36 @@ pub(crate) struct Changes {
 /// The git state a notification shows for a pane's directory, in the short form
 /// shell prompts and diffstats share: `main* · +120/-45`.
 ///
-/// None when there is no branch to attribute the changes to. A detached `HEAD`
-/// or a directory outside a repository contributes nothing rather than a bare
-/// `+120/-45` that explains neither where nor what. A dirty tree whose changes
-/// touch no text lines keeps its marker but shows no counts, since `+0/-0`
-/// would read as clean.
-pub(crate) fn label(branch: Option<&str>, changes: Option<Changes>) -> Option<String> {
-    let branch = display_branch(branch?);
+/// A dirty tree whose changes touch no text lines keeps its marker but shows no
+/// counts, since `+0/-0` would read as clean.
+pub(crate) fn label(branch: &str, changes: Option<Changes>) -> String {
+    let branch = display_branch(branch);
 
-    Some(match changes {
+    match changes {
         None => branch,
         Some(Changes {
             inserted: 0,
             deleted: 0,
         }) => format!("{branch}*"),
         Some(Changes { inserted, deleted }) => format!("{branch}* · +{inserted}/-{deleted}"),
-    })
+    }
 }
 
 /// Tracked changes versus `HEAD`; None when the tree is clean, or when git
-/// cannot answer, which is the same best-effort contract the rest of the
-/// enrichment follows.
+/// cannot answer by `deadline`, which is the same best-effort contract the rest
+/// of the enrichment follows.
 ///
 /// Only tracked changes count, so the `*` marker and the numbers always
 /// describe the same set of changes, and they are not a branch's total: work
 /// the pane has already committed shows no counts.
-pub(crate) fn changes(cwd: &str) -> Option<Changes> {
+pub(crate) fn changes(cwd: &str, deadline: Instant) -> Option<Changes> {
     // `--no-optional-locks` keeps the probe from refreshing the index. Git
     // takes `.git/index.lock` to do that, and a notification fires exactly when
     // an agent is likely to be running git in the same repository.
     //
     // `LC_ALL=C` keeps the summary line parseable: git translates it, and a
     // translated `Dateien geändert` carries no `(+)`/`(-)` suffix to key on.
-    let shortstat = command_stdout_with_timeout(
+    let shortstat = command_stdout_until(
         "git",
         &[
             "--no-optional-locks",
@@ -81,7 +74,7 @@ pub(crate) fn changes(cwd: &str) -> Option<Changes> {
             "HEAD",
         ],
         &[("LC_ALL", "C")],
-        GIT_TIMEOUT,
+        deadline,
     )?;
 
     changes_from_shortstat(&shortstat)
@@ -151,22 +144,13 @@ mod tests {
 
     #[test]
     fn labels_branch_dirty_marker_and_line_counts_like_a_prompt_does() {
-        assert_eq!(
-            label(Some("main"), changes(120, 45)).as_deref(),
-            Some("main* · +120/-45")
-        );
-        assert_eq!(
-            label(Some("feature/api"), changes(3, 0)).as_deref(),
-            Some("feature/api* · +3/-0")
-        );
+        assert_eq!(label("main", changes(120, 45)), "main* · +120/-45");
+        assert_eq!(label("feature/api", changes(3, 0)), "feature/api* · +3/-0");
         // Dirty without changed text lines (a binary file, an executable bit):
         // the marker stays, and `+0/-0` is not shown.
-        assert_eq!(label(Some("main"), changes(0, 0)).as_deref(), Some("main*"));
+        assert_eq!(label("main", changes(0, 0)), "main*");
         // A clean tree, or git not answering, carries neither marker nor counts.
-        assert_eq!(label(Some("main"), None).as_deref(), Some("main"));
-        // Nothing to attribute the changes to, so nothing to show.
-        assert_eq!(label(None, changes(120, 45)), None);
-        assert_eq!(label(None, None), None);
+        assert_eq!(label("main", None), "main");
     }
 
     #[test]

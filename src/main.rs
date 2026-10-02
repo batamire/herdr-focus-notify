@@ -13,6 +13,7 @@ mod util;
 
 use std::env;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use cli::{parse_cli_args, print_usage, CliAction};
 use event::{
@@ -32,6 +33,12 @@ use state::{
     cleanup_stale_state_files, clear_terminal_bindings, mark_notification_cleared,
     prune_stale_workspace_bindings, reset_notification_clearance,
 };
+
+/// Time the Herdr and git calls behind a notification's text get, together.
+/// Every one of them is best-effort, so a slow Herdr or a pathological
+/// repository costs at most this much delay, and the notification goes out
+/// with whatever was answered in time.
+const ENRICHMENT_BUDGET: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     match run() {
@@ -198,12 +205,19 @@ fn enrich_from_pane(
     details: Option<&PaneDetails>,
     herdr_bin: &str,
 ) {
-    let metadata = pane_row(&notification.pane_id, details, herdr_bin);
+    // One budget for every call below, not one each: they run in sequence, so
+    // per-call limits would add up. A call the budget no longer covers is
+    // skipped, and its field falls back like any other unanswered one.
+    let deadline = Instant::now() + ENRICHMENT_BUDGET;
+
+    let metadata = pane_row(&notification.pane_id, details, herdr_bin, deadline);
+    // Without a branch there is nothing to attribute the changes to, so the
+    // git probe is not worth its time: a detached `HEAD` or a directory outside
+    // a repository contributes nothing rather than a bare `+120/-45` that
+    // explains neither where nor what.
     let git_label = metadata.cwd.as_deref().and_then(|cwd| {
-        git::label(
-            worktree_branch(cwd, herdr_bin).as_deref(),
-            git::changes(cwd),
-        )
+        let branch = worktree_branch(cwd, herdr_bin, deadline)?;
+        Some(git::label(&branch, git::changes(cwd, deadline)))
     });
 
     enrich_notification(

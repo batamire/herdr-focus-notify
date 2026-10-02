@@ -299,7 +299,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     assert!(notifier_output.contains("Tidy up the parser tests"));
     assert!(!notifier_output.contains("Implement plugin"));
     assert!(notifier_output.contains("--subtitle"));
-    // The pane sits in a linked worktree, so the branch is that worktree's —
+    // The pane sits in a linked worktree, so the branch is that worktree's,
     // not the `main` of the checkout Herdr reports as the source.
     assert!(notifier_output.contains("Codex · feature/api* · +4/-4"));
     // The counts must come from a probe that leaves the index alone and cannot
@@ -310,6 +310,77 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     assert!(!fs::read_to_string(&herdr_log)
         .unwrap_or_default()
         .contains("explain"));
+    wait_for_detached_notifier(&temp_dir.join("state"));
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hanging_herdr_call_delays_the_notification_by_the_budget_at_most() {
+    let temp_dir = temp_test_dir();
+
+    // `worktree list` never answers in time. The trailing `:` keeps the shell
+    // from exec-ing into `sleep`, so the hang is a descendant holding stdout.
+    let herdr = temp_dir.join("herdr");
+    write_executable(
+        &herdr,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"agent get\" ]; then\n  printf '%s\\n' '{\"result\":{\"agent\":{\"focused\":false,\"pane_id\":\"w1:p2\",\"cwd\":\"/worktrees/api/src\",\"tab_id\":\"w1:t7\",\"terminal_title_stripped\":\"Tidy up the parser tests\"}}}'\nelif [ \"$1 $2\" = \"tab get\" ]; then\n  printf '%s\\n' '{\"result\":{\"tab\":{\"label\":\"status\",\"number\":7}}}'\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nelif [ \"$1 $2\" = \"worktree list\" ]; then\n  sleep 30; :\nfi\n",
+    );
+
+    let git = temp_dir.join("git");
+    write_executable(
+        &git,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_LOG\"\nprintf ' 2 files changed, 4 insertions(+), 4 deletions(-)\\n'\n",
+    );
+
+    let notifier = temp_dir.join("alerter");
+    write_executable(
+        &notifier,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
+    );
+
+    let notifier_log = temp_dir.join("notifier.log");
+    let git_log = temp_dir.join("git.log");
+    let path = path_with_temp_dir(&temp_dir);
+    let started = std::time::Instant::now();
+    let output = binary()
+        .env("HERDR_PLUGIN_EVENT", "pane.agent_status_changed")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p2","agent_status":"blocked","agent":"Codex"}}"#,
+        )
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("HERDR_PLUGIN_STATE_DIR", temp_dir.join("state"))
+        .env("NOTIFIER_LOG", &notifier_log)
+        .env("GIT_LOG", &git_log)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    let mut notifier_output = String::new();
+    for _ in 0..500 {
+        notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
+        if !notifier_output.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // What answered in time is still shown; the branch is dropped, and with it
+    // the git probe, which has no branch to attribute changes to.
+    assert!(notifier_output.contains("Blocked · sample-repo · status"));
+    assert!(notifier_output.contains("Tidy up the parser tests"));
+    assert!(
+        notifier_output.contains("--subtitle\nCodex\n"),
+        "{notifier_output}"
+    );
+    assert!(!git_log.exists());
     wait_for_detached_notifier(&temp_dir.join("state"));
     fs::remove_dir_all(temp_dir).unwrap();
 }

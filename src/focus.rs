@@ -4,10 +4,10 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::notification::FocusNotification;
-use crate::util::{command_stdout, sanitize_group_id};
+use crate::util::{command_stdout, command_stdout_until, sanitize_group_id};
 
 /// How long a notification click waits for Herdr's pane focus response. A real
 /// click runs detached, where an unanswered request would leave a stray process
@@ -114,11 +114,7 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
     }
 }
 
-/// The pane's own row of the Agent sidebar: what it is working on, which tab
-/// holds it, and which workspace that tab belongs to.
-///
-/// Best-effort by design: every field stays empty when Herdr cannot answer,
-/// and the notification then falls back to the event's own message.
+/// What `pane_row` gathers about a pane; None wherever Herdr did not answer.
 pub(crate) struct PaneMetadata {
     pub(crate) cwd: Option<String>,
     pub(crate) terminal_title: Option<String>,
@@ -146,23 +142,25 @@ pub(crate) fn pane_details(pane_id: &str, herdr_bin: &str) -> Option<PaneDetails
 /// it, and which workspace that tab belongs to.
 ///
 /// Two Herdr calls on top of `pane_details`, so it runs only for a notification
-/// that is actually going to be shown. Best-effort by design: every field stays
-/// empty when Herdr cannot answer, and the notification then falls back to the
-/// event's own message.
+/// that is actually going to be shown, and neither runs past `deadline`.
+/// Best-effort by design: every field stays empty when Herdr cannot answer in
+/// time, and the notification then falls back to the event's own message.
 pub(crate) fn pane_row(
     pane_id: &str,
     details: Option<&PaneDetails>,
     herdr_bin: &str,
+    deadline: Instant,
 ) -> PaneMetadata {
     let workspace = crate::util::workspace_id_from_pane_id(pane_id).unwrap_or("default");
-    let workspace_label = command_stdout(herdr_bin, &["workspace", "list"]).and_then(|json| {
-        workspace_label_from_list_json(&json, workspace)
-            .ok()
-            .flatten()
-    });
+    let workspace_label = command_stdout_until(herdr_bin, &["workspace", "list"], &[], deadline)
+        .and_then(|json| {
+            workspace_label_from_list_json(&json, workspace)
+                .ok()
+                .flatten()
+        });
     let tab_label = details
         .and_then(|details| details.tab_id.as_deref())
-        .and_then(|tab_id| command_stdout(herdr_bin, &["tab", "get", tab_id]))
+        .and_then(|tab_id| command_stdout_until(herdr_bin, &["tab", "get", tab_id], &[], deadline))
         .and_then(|json| tab_label_from_get_json(&json).ok().flatten());
 
     PaneMetadata {
@@ -179,9 +177,14 @@ pub(crate) fn pane_row(
 /// `## No commits yet on main`.
 ///
 /// Best-effort: None outside a worktree, on a detached `HEAD`, or when Herdr
-/// cannot answer.
-pub(crate) fn worktree_branch(cwd: &str, herdr_bin: &str) -> Option<String> {
-    let json = command_stdout(herdr_bin, &["worktree", "list", "--cwd", cwd])?;
+/// cannot answer by `deadline`.
+pub(crate) fn worktree_branch(cwd: &str, herdr_bin: &str, deadline: Instant) -> Option<String> {
+    let json = command_stdout_until(
+        herdr_bin,
+        &["worktree", "list", "--cwd", cwd],
+        &[],
+        deadline,
+    )?;
     branch_from_worktree_list_json(&json, cwd).ok().flatten()
 }
 

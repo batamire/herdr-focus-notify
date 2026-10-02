@@ -17,8 +17,10 @@ pub(crate) fn command_stdout(bin: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// Like `command_stdout`, but gives up once `timeout` has passed and reports
-/// None, and with `env` added to the child's environment.
+/// Like `command_stdout`, but gives up at `deadline` and reports None, and with
+/// `env` added to the child's environment. A deadline rather than a timeout,
+/// so that several calls can share one budget: a call that starts after the
+/// deadline does not run at all.
 ///
 /// `Command` has no timeout of its own, so the child is polled until the
 /// deadline, and its stdout is drained on another thread, both because a
@@ -28,13 +30,16 @@ pub(crate) fn command_stdout(bin: &str, args: &[&str]) -> Option<String> {
 /// So the deadline bounds the read as well as the exit, and the child runs in a
 /// process group of its own that is killed as a whole, rather than leaving a
 /// descendant holding the pipe after the child itself is gone.
-pub(crate) fn command_stdout_with_timeout(
+pub(crate) fn command_stdout_until(
     bin: &str,
     args: &[&str],
     env: &[(&str, &str)],
-    timeout: Duration,
+    deadline: Instant,
 ) -> Option<String> {
-    let deadline = Instant::now() + timeout;
+    if Instant::now() >= deadline {
+        return None;
+    }
+
     let mut child = Command::new(bin)
         .args(args)
         .envs(env.iter().copied())
@@ -140,11 +145,11 @@ mod tests {
 
     #[test]
     fn bounded_command_returns_output_when_it_finishes_in_time() {
-        let stdout = command_stdout_with_timeout(
+        let stdout = command_stdout_until(
             "sh",
             &["-c", "printf 'hello'"],
             &[],
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
         );
 
         assert_eq!(stdout.as_deref(), Some("hello"));
@@ -152,11 +157,11 @@ mod tests {
 
     #[test]
     fn bounded_command_passes_its_environment_through() {
-        let stdout = command_stdout_with_timeout(
+        let stdout = command_stdout_until(
             "sh",
             &["-c", "printf '%s' \"$LC_ALL\""],
             &[("LC_ALL", "C")],
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
         );
 
         assert_eq!(stdout.as_deref(), Some("C"));
@@ -165,8 +170,12 @@ mod tests {
     #[test]
     fn bounded_command_gives_up_and_reports_none_when_it_overruns() {
         let started = Instant::now();
-        let stdout =
-            command_stdout_with_timeout("sh", &["-c", "sleep 30"], &[], Duration::from_millis(200));
+        let stdout = command_stdout_until(
+            "sh",
+            &["-c", "sleep 30"],
+            &[],
+            Instant::now() + Duration::from_millis(200),
+        );
 
         assert_eq!(stdout, None);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -176,10 +185,10 @@ mod tests {
     fn bounded_command_kills_a_descendant_still_holding_its_stdout() {
         // The trailing `wait` keeps the shell from exec-ing into `sleep`, so the
         // shell is the child, `sleep` the descendant, and both hold the pipe.
-        let temp_dir = temp_dir("descendant");
-        let pid_file = temp_dir.join("sleep.pid");
+        let temp_dir = TempDir::new("descendant");
+        let pid_file = temp_dir.0.join("sleep.pid");
         let started = Instant::now();
-        let stdout = command_stdout_with_timeout(
+        let stdout = command_stdout_until(
             "sh",
             &[
                 "-c",
@@ -187,7 +196,7 @@ mod tests {
                 pid_file.to_str().unwrap(),
             ],
             &[],
-            Duration::from_millis(500),
+            Instant::now() + Duration::from_millis(500),
         );
 
         assert_eq!(stdout, None);
@@ -199,10 +208,10 @@ mod tests {
     fn bounded_command_stops_reading_at_the_deadline_after_the_child_exits() {
         // The shell exits at once, but the backgrounded `sleep` keeps the pipe
         // open: success alone must not wait for an EOF that never comes.
-        let temp_dir = temp_dir("background");
-        let pid_file = temp_dir.join("sleep.pid");
+        let temp_dir = TempDir::new("background");
+        let pid_file = temp_dir.0.join("sleep.pid");
         let started = Instant::now();
-        let stdout = command_stdout_with_timeout(
+        let stdout = command_stdout_until(
             "sh",
             &[
                 "-c",
@@ -210,7 +219,7 @@ mod tests {
                 pid_file.to_str().unwrap(),
             ],
             &[],
-            Duration::from_millis(500),
+            Instant::now() + Duration::from_millis(500),
         );
 
         assert_eq!(stdout, None);
@@ -218,14 +227,42 @@ mod tests {
         assert_process_exits(&std::fs::read_to_string(&pid_file).unwrap());
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "herdr-focus-notify-util-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn bounded_command_does_not_start_once_the_deadline_has_passed() {
+        // Calls sharing one budget: whatever comes after the budget is spent
+        // must not run at all.
+        let temp_dir = TempDir::new("expired");
+        let marker = temp_dir.0.join("ran");
+        let stdout = command_stdout_until(
+            "sh",
+            &["-c", "touch \"$0\"", marker.to_str().unwrap()],
+            &[],
+            Instant::now(),
+        );
+
+        assert_eq!(stdout, None);
+        assert!(!marker.exists());
+    }
+
+    /// A scratch directory removed when the test ends, pass or fail.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-focus-notify-util-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Waits for `pid` to disappear. A killed descendant is reaped by launchd
