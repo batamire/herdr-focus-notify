@@ -202,7 +202,7 @@ fn enrich_from_pane(
     let git_label = metadata.cwd.as_deref().and_then(|cwd| {
         git::label(
             worktree_branch(cwd, herdr_bin).as_deref(),
-            git::changed_lines(cwd),
+            git::changes(cwd),
         )
     });
 

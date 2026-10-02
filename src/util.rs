@@ -1,5 +1,7 @@
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How often a bounded command is checked for having finished.
@@ -15,49 +17,82 @@ pub(crate) fn command_stdout(bin: &str, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// Like `command_stdout`, but kills the command once `timeout` has passed and
-/// reports None, and with `env` added to the child's environment. `Command` has
-/// no timeout of its own, so the child is polled until the deadline; stdout is
-/// drained on another thread because a command that fills the pipe buffer
-/// before it exits would otherwise deadlock.
+/// Like `command_stdout`, but gives up once `timeout` has passed and reports
+/// None, and with `env` added to the child's environment.
+///
+/// `Command` has no timeout of its own, so the child is polled until the
+/// deadline, and its stdout is drained on another thread, both because a
+/// command that fills the pipe buffer before it exits would otherwise deadlock
+/// and because the pipe can outlive the child: any descendant it started
+/// inherits the write end, and the read only ends once every holder closes it.
+/// So the deadline bounds the read as well as the exit, and the child runs in a
+/// process group of its own that is killed as a whole, rather than leaving a
+/// descendant holding the pipe after the child itself is gone.
 pub(crate) fn command_stdout_with_timeout(
     bin: &str,
     args: &[&str],
     env: &[(&str, &str)],
     timeout: Duration,
 ) -> Option<String> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new(bin)
         .args(args)
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
 
     let mut pipe = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = mpsc::channel();
+    // Detached on purpose: a descendant that escaped the process group can hold
+    // the pipe past the deadline, and the reader is then abandoned rather than
+    // waited for.
+    std::thread::spawn(move || {
         let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
-        buffer
+        let read = pipe.read_to_end(&mut buffer);
+        let _ = sender.send(read.map(|_| buffer));
     });
 
-    let deadline = Instant::now() + timeout;
-    let succeeded = loop {
+    let stdout = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(TIMEOUT_POLL),
-            // Past the deadline, or the wait itself failed: stop the child and
-            // let the reader thread finish with whatever was captured.
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
+            Ok(Some(status)) if status.success() => {
+                break receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .ok()
+                    .and_then(Result::ok);
             }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(TIMEOUT_POLL),
+            // Failed, past the deadline, or the wait itself failed.
+            _ => break None,
         }
     };
 
-    let stdout = reader.join().ok()?;
-    succeeded.then(|| String::from_utf8(stdout).ok())?
+    // Whatever the outcome, nothing the child started may outlive the call:
+    // a descendant left running would keep working in the pane's repository.
+    kill_process_group(&mut child);
+    String::from_utf8(stdout?).ok()
+}
+
+/// Kills the process group `child` leads, then reaps the child. Each step is
+/// best-effort: the group is usually gone already, since a command that has
+/// exited and closed its stdout normally leaves nothing behind.
+fn kill_process_group(child: &mut Child) {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+
+    if let Ok(group) = i32::try_from(child.id()) {
+        // SAFETY: `kill` only sends a signal; a negative pid names the process
+        // group the child leads, which `process_group(0)` created for it.
+        unsafe {
+            kill(-group, SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(crate) fn sanitize_group_id(value: &str) -> String {
@@ -135,6 +170,82 @@ mod tests {
 
         assert_eq!(stdout, None);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_command_kills_a_descendant_still_holding_its_stdout() {
+        // The trailing `wait` keeps the shell from exec-ing into `sleep`, so the
+        // shell is the child, `sleep` the descendant, and both hold the pipe.
+        let temp_dir = temp_dir("descendant");
+        let pid_file = temp_dir.join("sleep.pid");
+        let started = Instant::now();
+        let stdout = command_stdout_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "sleep 30 & echo $! > \"$0\"; wait",
+                pid_file.to_str().unwrap(),
+            ],
+            &[],
+            Duration::from_millis(500),
+        );
+
+        assert_eq!(stdout, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_process_exits(&std::fs::read_to_string(&pid_file).unwrap());
+    }
+
+    #[test]
+    fn bounded_command_stops_reading_at_the_deadline_after_the_child_exits() {
+        // The shell exits at once, but the backgrounded `sleep` keeps the pipe
+        // open: success alone must not wait for an EOF that never comes.
+        let temp_dir = temp_dir("background");
+        let pid_file = temp_dir.join("sleep.pid");
+        let started = Instant::now();
+        let stdout = command_stdout_with_timeout(
+            "sh",
+            &[
+                "-c",
+                "sleep 30 & echo $! > \"$0\"; printf 'partial'",
+                pid_file.to_str().unwrap(),
+            ],
+            &[],
+            Duration::from_millis(500),
+        );
+
+        assert_eq!(stdout, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_process_exits(&std::fs::read_to_string(&pid_file).unwrap());
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-focus-notify-util-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Waits for `pid` to disappear. A killed descendant is reaped by launchd
+    /// once its parent is gone too, which takes a moment.
+    fn assert_process_exits(pid: &str) {
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let alive = Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("descendant {pid} outlived the bounded command");
     }
 
     #[test]

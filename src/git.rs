@@ -23,30 +23,47 @@ const MAX_BRANCH_CHARS: usize = 24;
 /// work (`feature/…`), the tail separates siblings (`…-layout`).
 const BRANCH_HEAD_CHARS: usize = 12;
 
+/// Tracked changes versus `HEAD` in a pane's directory: a dirty tree, with the
+/// lines it adds and removes.
+///
+/// Both counts can be zero on a dirty tree. A binary file or an executable bit
+/// changes no text lines, so the counts describe the size of the change and
+/// never decide whether there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Changes {
+    pub(crate) inserted: usize,
+    pub(crate) deleted: usize,
+}
+
 /// The git state a notification shows for a pane's directory, in the short form
 /// shell prompts and diffstats share: `main* · +120/-45`.
 ///
 /// None when there is no branch to attribute the changes to. A detached `HEAD`
 /// or a directory outside a repository contributes nothing rather than a bare
-/// `+120/-45` that explains neither where nor what.
-pub(crate) fn label(branch: Option<&str>, changed_lines: Option<(usize, usize)>) -> Option<String> {
+/// `+120/-45` that explains neither where nor what. A dirty tree whose changes
+/// touch no text lines keeps its marker but shows no counts, since `+0/-0`
+/// would read as clean.
+pub(crate) fn label(branch: Option<&str>, changes: Option<Changes>) -> Option<String> {
     let branch = display_branch(branch?);
-    let (inserted, deleted) = changed_lines.unwrap_or((0, 0));
 
-    if inserted == 0 && deleted == 0 {
-        return Some(branch);
-    }
-
-    Some(format!("{branch}* · +{inserted}/-{deleted}"))
+    Some(match changes {
+        None => branch,
+        Some(Changes {
+            inserted: 0,
+            deleted: 0,
+        }) => format!("{branch}*"),
+        Some(Changes { inserted, deleted }) => format!("{branch}* · +{inserted}/-{deleted}"),
+    })
 }
 
-/// Insertions and deletions versus `HEAD`; None when git cannot answer, which
-/// is the same best-effort contract the rest of the enrichment follows.
+/// Tracked changes versus `HEAD`; None when the tree is clean, or when git
+/// cannot answer, which is the same best-effort contract the rest of the
+/// enrichment follows.
 ///
-/// Counts cover tracked changes only, so the `*` marker and the numbers always
+/// Only tracked changes count, so the `*` marker and the numbers always
 /// describe the same set of changes, and they are not a branch's total: work
 /// the pane has already committed shows no counts.
-pub(crate) fn changed_lines(cwd: &str) -> Option<(usize, usize)> {
+pub(crate) fn changes(cwd: &str) -> Option<Changes> {
     // `--no-optional-locks` keeps the probe from refreshing the index. Git
     // takes `.git/index.lock` to do that, and a notification fires exactly when
     // an agent is likely to be running git in the same repository.
@@ -67,29 +84,43 @@ pub(crate) fn changed_lines(cwd: &str) -> Option<(usize, usize)> {
         GIT_TIMEOUT,
     )?;
 
-    Some(changed_lines_from_shortstat(&shortstat))
+    changes_from_shortstat(&shortstat)
 }
 
 /// ` 3 files changed, 12 insertions(+), 4 deletions(-)`, one clause per kind of
-/// count, and either clause is left out when its count is zero. The counts are
-/// keyed on the `(+)`/`(-)` suffixes rather than the words, which are
-/// pluralized (`1 insertion(+)`) and translated.
-fn changed_lines_from_shortstat(shortstat: &str) -> (usize, usize) {
-    shortstat
-        .split(',')
-        .fold((0, 0), |(inserted, deleted), clause| {
-            let clause = clause.trim();
-            let count = clause
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse::<usize>().ok());
+/// count, and either clause is left out when its count is zero. A clean tree
+/// prints nothing at all, so any summary line means the tree is dirty, even
+/// ` 1 file changed, 0 insertions(+), 0 deletions(-)` for a binary file.
+///
+/// The counts are keyed on the `(+)`/`(-)` suffixes rather than the words,
+/// which are pluralized (`1 insertion(+)`) and translated.
+fn changes_from_shortstat(shortstat: &str) -> Option<Changes> {
+    if shortstat.trim().is_empty() {
+        return None;
+    }
 
-            match count {
-                Some(count) if clause.ends_with("(+)") => (inserted + count, deleted),
-                Some(count) if clause.ends_with("(-)") => (inserted, deleted + count),
-                _ => (inserted, deleted),
-            }
-        })
+    let mut changes = Changes {
+        inserted: 0,
+        deleted: 0,
+    };
+    for clause in shortstat.split(',') {
+        let clause = clause.trim();
+        let Some(count) = clause
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+
+        if clause.ends_with("(+)") {
+            changes.inserted += count;
+        } else if clause.ends_with("(-)") {
+            changes.deleted += count;
+        }
+    }
+
+    Some(changes)
 }
 
 /// Middle-truncates a branch too long for the subtitle's one line.
@@ -114,21 +145,27 @@ fn display_branch(branch: &str) -> String {
 mod tests {
     use super::*;
 
+    fn changes(inserted: usize, deleted: usize) -> Option<Changes> {
+        Some(Changes { inserted, deleted })
+    }
+
     #[test]
     fn labels_branch_dirty_marker_and_line_counts_like_a_prompt_does() {
         assert_eq!(
-            label(Some("main"), Some((120, 45))).as_deref(),
+            label(Some("main"), changes(120, 45)).as_deref(),
             Some("main* · +120/-45")
         );
         assert_eq!(
-            label(Some("feature/api"), Some((3, 0))).as_deref(),
+            label(Some("feature/api"), changes(3, 0)).as_deref(),
             Some("feature/api* · +3/-0")
         );
-        // A clean tree carries neither marker nor counts.
-        assert_eq!(label(Some("main"), Some((0, 0))).as_deref(), Some("main"));
+        // Dirty without changed text lines (a binary file, an executable bit):
+        // the marker stays, and `+0/-0` is not shown.
+        assert_eq!(label(Some("main"), changes(0, 0)).as_deref(), Some("main*"));
+        // A clean tree, or git not answering, carries neither marker nor counts.
         assert_eq!(label(Some("main"), None).as_deref(), Some("main"));
         // Nothing to attribute the changes to, so nothing to show.
-        assert_eq!(label(None, Some((120, 45))), None);
+        assert_eq!(label(None, changes(120, 45)), None);
         assert_eq!(label(None, None), None);
     }
 
@@ -151,19 +188,31 @@ mod tests {
     #[test]
     fn sums_shortstat_by_its_count_suffixes() {
         assert_eq!(
-            changed_lines_from_shortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)"),
-            (12, 4)
+            changes_from_shortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)"),
+            changes(12, 4)
         );
         // Pluralization varies, and either clause is omitted at zero.
         assert_eq!(
-            changed_lines_from_shortstat(" 1 file changed, 1 insertion(+)"),
-            (1, 0)
+            changes_from_shortstat(" 1 file changed, 1 insertion(+)"),
+            changes(1, 0)
         );
         assert_eq!(
-            changed_lines_from_shortstat(" 2 files changed, 5 deletions(-)"),
-            (0, 5)
+            changes_from_shortstat(" 2 files changed, 5 deletions(-)"),
+            changes(0, 5)
         );
         // A clean tree prints nothing at all.
-        assert_eq!(changed_lines_from_shortstat(""), (0, 0));
+        assert_eq!(changes_from_shortstat(""), None);
+        assert_eq!(changes_from_shortstat("\n"), None);
+    }
+
+    #[test]
+    fn a_summary_without_changed_lines_still_means_a_dirty_tree() {
+        // What `git diff --shortstat HEAD` prints for a changed binary file or
+        // a changed executable bit.
+        assert_eq!(
+            changes_from_shortstat(" 1 file changed, 0 insertions(+), 0 deletions(-)\n"),
+            changes(0, 0)
+        );
+        assert_eq!(changes_from_shortstat(" 1 file changed\n"), changes(0, 0));
     }
 }
