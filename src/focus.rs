@@ -56,6 +56,7 @@ struct TabGetResult {
 #[derive(Debug, Deserialize)]
 struct TabInfo {
     label: Option<String>,
+    number: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,9 +133,14 @@ pub(crate) struct PaneDetails {
 }
 
 /// One `herdr agent get`, so the decision to notify at all and the
-/// notification's own row read the pane once. None when Herdr cannot answer.
-pub(crate) fn pane_details(pane_id: &str, herdr_bin: &str) -> Option<PaneDetails> {
-    let json = command_stdout(herdr_bin, &["agent", "get", pane_id])?;
+/// notification's own row read the pane once. None when Herdr cannot answer by
+/// `deadline`, or answers about another pane.
+pub(crate) fn pane_details(
+    pane_id: &str,
+    herdr_bin: &str,
+    deadline: Instant,
+) -> Option<PaneDetails> {
+    let json = command_stdout_until(herdr_bin, &["agent", "get", pane_id], &[], deadline)?;
     pane_details_from_get_json(&json, pane_id).ok().flatten()
 }
 
@@ -237,9 +243,12 @@ fn pane_details_from_get_json(
     Ok(envelope
         .result
         .and_then(|result| result.agent)
+        // A stale snapshot can describe a pane Herdr has since replaced. None of
+        // it applies then: not its focus, and not its directory, tab or title,
+        // which would name another pane on a notification that focuses this one.
+        .filter(|agent| agent.pane_id.as_deref() == Some(expected_pane_id))
         .map(|agent| PaneDetails {
-            // A stale snapshot can describe a pane Herdr has since replaced.
-            focused: agent.focused && agent.pane_id.as_deref() == Some(expected_pane_id),
+            focused: agent.focused,
             cwd: agent.cwd,
             tab_id: agent.tab_id,
             terminal_title: agent.terminal_title_stripped,
@@ -250,10 +259,17 @@ fn tab_label_from_get_json(json: &str) -> Result<Option<String>, String> {
     let envelope: TabGetEnvelope =
         serde_json::from_str(json).map_err(|err| format!("invalid tab get json: {err}"))?;
 
+    // Herdr already labels an unnamed tab with its number, as the sidebar
+    // shows it; the number stands in should a reply ever leave the label out,
+    // since it is what tells two unnamed tabs of one workspace apart.
     Ok(envelope
         .result
         .and_then(|result| result.tab)
-        .and_then(|tab| tab.label))
+        .and_then(|tab| {
+            tab.label
+                .filter(|label| !label.trim().is_empty())
+                .or_else(|| tab.number.map(|number| number.to_string()))
+        }))
 }
 
 fn workspace_label_from_list_json(
@@ -565,13 +581,13 @@ mod tests {
             details.terminal_title.as_deref(),
             Some("Tidy up the parser tests")
         );
-        // The report has to describe the pane that was asked about.
-        assert!(
-            !pane_details_from_get_json(json, "w1:p9")
-                .unwrap()
-                .unwrap()
-                .focused
-        );
+        // The report has to describe the pane that was asked about, or none of
+        // it is used.
+        assert!(pane_details_from_get_json(json, "w1:p9").unwrap().is_none());
+        let without_pane_id = r#"{"result":{"agent":{"focused":true,"cwd":"/tmp/repo"}}}"#;
+        assert!(pane_details_from_get_json(without_pane_id, "w1:p3")
+            .unwrap()
+            .is_none());
         assert!(pane_details_from_get_json("not json", "w1:p3").is_err());
     }
 
@@ -637,8 +653,27 @@ mod tests {
             tab_label_from_get_json(json).unwrap().as_deref(),
             Some("status")
         );
+        // An unnamed tab is known by its number.
         assert_eq!(
-            tab_label_from_get_json(r#"{"result":{"tab":{"number":7}}}"#).unwrap(),
+            tab_label_from_get_json(r#"{"result":{"tab":{"label":"7","number":7}}}"#)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tab_label_from_get_json(r#"{"result":{"tab":{"number":7}}}"#)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tab_label_from_get_json(r#"{"result":{"tab":{"label":" ","number":7}}}"#)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            tab_label_from_get_json(r#"{"result":{"tab":{}}}"#).unwrap(),
             None
         );
     }

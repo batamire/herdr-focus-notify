@@ -34,11 +34,12 @@ use state::{
     prune_stale_workspace_bindings, reset_notification_clearance,
 };
 
-/// Time the Herdr and git calls behind a notification's text get, together.
-/// Every one of them is best-effort, so a slow Herdr or a pathological
+/// Time the Herdr and git calls behind one notification get, together: the
+/// `agent get` that decides whether to show it, and the lookups behind its
+/// text. Every one of them is best-effort, so a slow Herdr or a pathological
 /// repository costs at most this much delay, and the notification goes out
 /// with whatever was answered in time.
-const ENRICHMENT_BUDGET: Duration = Duration::from_secs(2);
+const LOOKUP_BUDGET: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     match run() {
@@ -86,7 +87,9 @@ fn run() -> Result<(), String> {
         }
         CliAction::CheckPaneVisibility(pane_id) => {
             let herdr_bin = resolve_herdr_bin()?;
-            let focused = pane_details(&pane_id, &herdr_bin).is_some_and(|details| details.focused);
+            let deadline = Instant::now() + LOOKUP_BUDGET;
+            let focused =
+                pane_details(&pane_id, &herdr_bin, deadline).is_some_and(|details| details.focused);
             if notification_decision(&pane_id, focused) == NotificationDecision::Skip {
                 return Ok(());
             }
@@ -156,7 +159,14 @@ fn run() -> Result<(), String> {
     // already looking at this pane, and what the pane is working on. The skip
     // decision runs before the remaining Herdr and git calls, because a
     // suppressed notification must not pay for them.
-    let details = pane_details(&notification.pane_id, &herdr_bin);
+    //
+    // One budget covers all of them, not one each: they run in sequence, so
+    // per-call limits would add up. A call the budget no longer covers is
+    // skipped, and its answer falls back like any other unanswered one: an
+    // unknown focus sends the notification, an unknown field keeps the
+    // event's own copy.
+    let deadline = Instant::now() + LOOKUP_BUDGET;
+    let details = pane_details(&notification.pane_id, &herdr_bin, deadline);
     let focused = details.as_ref().is_some_and(|details| details.focused);
 
     let mut notification_decision = notification_decision(&notification.pane_id, focused);
@@ -172,7 +182,7 @@ fn run() -> Result<(), String> {
     }
 
     if action != CliAction::Test {
-        enrich_from_pane(&mut notification, details.as_ref(), &herdr_bin);
+        enrich_from_pane(&mut notification, details.as_ref(), &herdr_bin, deadline);
     }
 
     reset_notification_clearance(&notification.pane_id)
@@ -204,12 +214,8 @@ fn enrich_from_pane(
     notification: &mut FocusNotification,
     details: Option<&PaneDetails>,
     herdr_bin: &str,
+    deadline: Instant,
 ) {
-    // One budget for every call below, not one each: they run in sequence, so
-    // per-call limits would add up. A call the budget no longer covers is
-    // skipped, and its field falls back like any other unanswered one.
-    let deadline = Instant::now() + ENRICHMENT_BUDGET;
-
     let metadata = pane_row(&notification.pane_id, details, herdr_bin, deadline);
     // Without a branch there is nothing to attribute the changes to, so the
     // git probe is not worth its time: a detached `HEAD` or a directory outside

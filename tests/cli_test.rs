@@ -316,7 +316,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
 
 #[cfg(unix)]
 #[test]
-fn a_hanging_herdr_call_delays_the_notification_by_the_budget_at_most() {
+fn a_hanging_worktree_lookup_delays_the_notification_by_the_budget_at_most() {
     let temp_dir = temp_test_dir();
 
     // `worktree list` never answers in time. The trailing `:` keeps the shell
@@ -381,6 +381,73 @@ fn a_hanging_herdr_call_delays_the_notification_by_the_budget_at_most() {
         "{notifier_output}"
     );
     assert!(!git_log.exists());
+    wait_for_detached_notifier(&temp_dir.join("state"));
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hanging_agent_lookup_still_sends_the_notification_within_the_budget() {
+    let temp_dir = temp_test_dir();
+
+    // `agent get` decides whether to notify at all, and it never answers in
+    // time. Every other call would answer at once, but the budget is spent.
+    let herdr = temp_dir.join("herdr");
+    write_executable(
+        &herdr,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1 $2\" = \"agent get\" ]; then\n  sleep 30; :\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
+    );
+
+    let notifier = temp_dir.join("alerter");
+    write_executable(
+        &notifier,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
+    );
+
+    let notifier_log = temp_dir.join("notifier.log");
+    let herdr_log = temp_dir.join("herdr.log");
+    let path = path_with_temp_dir(&temp_dir);
+    let started = std::time::Instant::now();
+    let output = binary()
+        .env("HERDR_PLUGIN_EVENT", "pane.agent_status_changed")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p2","agent_status":"blocked","agent":"Codex"}}"#,
+        )
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("HERDR_PLUGIN_STATE_DIR", temp_dir.join("state"))
+        .env("NOTIFIER_LOG", &notifier_log)
+        .env("HERDR_LOG", &herdr_log)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    let mut notifier_output = String::new();
+    for _ in 0..500 {
+        notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
+        if !notifier_output.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // An unknown focus sends rather than skips, with the event's own copy; the
+    // lookups behind the text are skipped, since the budget is already spent.
+    assert!(
+        notifier_output.contains("--title\nBlocked\n"),
+        "{notifier_output}"
+    );
+    assert!(notifier_output.contains("Open the pane to review and respond."));
+    assert_eq!(
+        fs::read_to_string(&herdr_log).unwrap_or_default(),
+        "agent get w1:p2\n"
+    );
     wait_for_detached_notifier(&temp_dir.join("state"));
     fs::remove_dir_all(temp_dir).unwrap();
 }
