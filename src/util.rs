@@ -1,10 +1,12 @@
+use std::ffi::c_int;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// How often a bounded command is checked for having finished.
+/// How often a bounded command whose output has not ended is checked for
+/// having failed.
 const TIMEOUT_POLL: Duration = Duration::from_millis(20);
 
 /// Runs a command and returns its stdout on success. None when the binary is
@@ -60,15 +62,27 @@ pub(crate) fn command_stdout_until(
         let _ = sender.send(read.map(|_| buffer));
     });
 
+    // Waiting on the reader rather than sleeping: a command closes its stdout
+    // as it exits, so a quick one is noticed at once instead of a poll later.
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    // Some once the reader has seen the end of the output.
+    let mut read = None;
     let stdout = loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                break receiver
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .ok()
+                break read
+                    .or_else(|| receiver.recv_timeout(remaining()).ok())
                     .and_then(Result::ok);
             }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(TIMEOUT_POLL),
+            Ok(None) if Instant::now() < deadline => match read {
+                // The output has ended, so the exit is a moment away.
+                Some(_) => std::thread::sleep(Duration::from_millis(1)),
+                None => match receiver.recv_timeout(TIMEOUT_POLL.min(remaining())) {
+                    Ok(result) => read = Some(result),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                },
+            },
             // Failed, past the deadline, or the wait itself failed.
             _ => break None,
         }
@@ -85,11 +99,11 @@ pub(crate) fn command_stdout_until(
 /// exited and closed its stdout normally leaves nothing behind.
 fn kill_process_group(child: &mut Child) {
     extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
+        fn kill(pid: c_int, signal: c_int) -> c_int;
     }
-    const SIGKILL: i32 = 9;
+    const SIGKILL: c_int = 9;
 
-    if let Ok(group) = i32::try_from(child.id()) {
+    if let Ok(group) = c_int::try_from(child.id()) {
         // SAFETY: `kill` only sends a signal; a negative pid names the process
         // group the child leads, which `process_group(0)` created for it.
         unsafe {

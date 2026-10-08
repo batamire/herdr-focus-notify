@@ -256,13 +256,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
         "#!/bin/sh\nprintf '%s LC_ALL=%s\\n' \"$*\" \"$LC_ALL\" >> \"$GIT_LOG\"\nprintf ' 2 files changed, 4 insertions(+), 4 deletions(-)\\n'\n",
     );
 
-    let notifier = temp_dir.join("alerter");
-    write_executable(
-        &notifier,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
-    );
-
-    let notifier_log = temp_dir.join("notifier.log");
+    let notifier_log = write_logging_notifier(&temp_dir);
     let herdr_log = temp_dir.join("herdr.log");
     let git_log = temp_dir.join("git.log");
     let path = path_with_temp_dir(&temp_dir);
@@ -284,14 +278,7 @@ fn normal_notification_names_the_pane_and_never_requests_an_explanation() {
     assert!(output.status.success());
     // The notifier runs in a detached script. The fake notifier renames its
     // log into place, so the file appears only once all arguments are written.
-    let mut notifier_output = String::new();
-    for _ in 0..500 {
-        notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
-        if !notifier_output.is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let notifier_output = wait_for_notifier_output(&notifier_log);
 
     assert!(notifier_output.contains("Blocked · sample-repo · status"));
     // The pane's terminal title is the message; the event's own title is not
@@ -333,13 +320,7 @@ fn a_hanging_worktree_lookup_delays_the_notification_by_the_budget_at_most() {
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_LOG\"\nprintf ' 2 files changed, 4 insertions(+), 4 deletions(-)\\n'\n",
     );
 
-    let notifier = temp_dir.join("alerter");
-    write_executable(
-        &notifier,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
-    );
-
-    let notifier_log = temp_dir.join("notifier.log");
+    let notifier_log = write_logging_notifier(&temp_dir);
     let git_log = temp_dir.join("git.log");
     let path = path_with_temp_dir(&temp_dir);
     let started = std::time::Instant::now();
@@ -363,21 +344,14 @@ fn a_hanging_worktree_lookup_delays_the_notification_by_the_budget_at_most() {
         "took {:?}",
         started.elapsed()
     );
-    let mut notifier_output = String::new();
-    for _ in 0..500 {
-        notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
-        if !notifier_output.is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let notifier_output = wait_for_notifier_output(&notifier_log);
 
     // What answered in time is still shown; the branch is dropped, and with it
     // the git probe, which has no branch to attribute changes to.
     assert!(notifier_output.contains("Blocked · sample-repo · status"));
     assert!(notifier_output.contains("Tidy up the parser tests"));
     assert!(
-        notifier_output.contains("--subtitle\nCodex\n"),
+        notifier_output.contains("--subtitle=Codex\n"),
         "{notifier_output}"
     );
     assert!(!git_log.exists());
@@ -398,13 +372,7 @@ fn a_hanging_agent_lookup_still_sends_the_notification_within_the_budget() {
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERDR_LOG\"\nif [ \"$1 $2\" = \"agent get\" ]; then\n  sleep 30; :\nelif [ \"$1 $2\" = \"workspace list\" ]; then\n  printf '%s\\n' '{\"result\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"label\":\"sample-repo\"}]}}'\nfi\n",
     );
 
-    let notifier = temp_dir.join("alerter");
-    write_executable(
-        &notifier,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
-    );
-
-    let notifier_log = temp_dir.join("notifier.log");
+    let notifier_log = write_logging_notifier(&temp_dir);
     let herdr_log = temp_dir.join("herdr.log");
     let path = path_with_temp_dir(&temp_dir);
     let started = std::time::Instant::now();
@@ -428,19 +396,12 @@ fn a_hanging_agent_lookup_still_sends_the_notification_within_the_budget() {
         "took {:?}",
         started.elapsed()
     );
-    let mut notifier_output = String::new();
-    for _ in 0..500 {
-        notifier_output = fs::read_to_string(&notifier_log).unwrap_or_default();
-        if !notifier_output.is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let notifier_output = wait_for_notifier_output(&notifier_log);
 
     // An unknown focus sends rather than skips, with the event's own copy; the
     // lookups behind the text are skipped, since the budget is already spent.
     assert!(
-        notifier_output.contains("--title\nBlocked\n"),
+        notifier_output.contains("--title=Blocked\n"),
         "{notifier_output}"
     );
     assert!(notifier_output.contains("Open the pane to review and respond."));
@@ -549,6 +510,30 @@ fn wait_for_detached_notifier(state_dir: &Path) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("detached notifier script did not finish");
+}
+
+/// Installs a fake `alerter` that records its arguments, one per line, and
+/// returns the log it writes; `NOTIFIER_LOG` has to point the plugin at it.
+#[cfg(unix)]
+fn write_logging_notifier(temp_dir: &Path) -> PathBuf {
+    write_executable(
+        &temp_dir.join("alerter"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NOTIFIER_LOG.tmp\"\nmv \"$NOTIFIER_LOG.tmp\" \"$NOTIFIER_LOG\"\n",
+    );
+    temp_dir.join("notifier.log")
+}
+
+/// The arguments the detached notifier was called with, once it has run.
+#[cfg(unix)]
+fn wait_for_notifier_output(notifier_log: &Path) -> String {
+    for _ in 0..500 {
+        let output = fs::read_to_string(notifier_log).unwrap_or_default();
+        if !output.is_empty() {
+            return output;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    String::new()
 }
 
 #[cfg(unix)]

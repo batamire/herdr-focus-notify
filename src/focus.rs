@@ -14,19 +14,15 @@ use crate::util::{command_stdout, command_stdout_until, sanitize_group_id};
 /// behind; `--test` runs in the foreground and would hang the action outright.
 const FOCUS_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The `{"result": ...}` wrapper around every Herdr CLI reply.
 #[derive(Debug, Deserialize)]
-struct PaneListEnvelope {
-    result: Option<PaneListResult>,
+struct Envelope<T> {
+    result: Option<T>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PaneListResult {
     panes: Vec<AgentInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentGetEnvelope {
-    result: Option<AgentGetResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,11 +40,6 @@ struct AgentInfo {
 }
 
 #[derive(Debug, Deserialize)]
-struct TabGetEnvelope {
-    result: Option<TabGetResult>,
-}
-
-#[derive(Debug, Deserialize)]
 struct TabGetResult {
     tab: Option<TabInfo>,
 }
@@ -60,11 +51,6 @@ struct TabInfo {
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkspaceListEnvelope {
-    result: Option<WorkspaceListResult>,
-}
-
-#[derive(Debug, Deserialize)]
 struct WorkspaceListResult {
     workspaces: Vec<WorkspaceInfo>,
 }
@@ -73,11 +59,6 @@ struct WorkspaceListResult {
 struct WorkspaceInfo {
     workspace_id: String,
     label: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorktreeListEnvelope {
-    result: Option<WorktreeListResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,21 +87,12 @@ pub(crate) fn test_notification(herdr_bin: &str) -> FocusNotification {
     FocusNotification {
         pane_id: pane_id.clone(),
         status: "blocked".to_string(),
-        agent: "Test".to_string(),
         title: "Focus notification test".to_string(),
         body: "Click to return to this Herdr pane.".to_string(),
         subtitle: None,
         group: format!("herdr-{}", sanitize_group_id(&pane_id)),
         app_icon: None,
     }
-}
-
-/// What `pane_row` gathers about a pane; None wherever Herdr did not answer.
-pub(crate) struct PaneMetadata {
-    pub(crate) cwd: Option<String>,
-    pub(crate) terminal_title: Option<String>,
-    pub(crate) tab_label: Option<String>,
-    pub(crate) workspace_label: Option<String>,
 }
 
 /// Everything one `herdr agent get` answers about a pane: whether Herdr calls it
@@ -144,37 +116,22 @@ pub(crate) fn pane_details(
     pane_details_from_get_json(&json, pane_id).ok().flatten()
 }
 
-/// The pane's row of the Agent sidebar: what it is working on, which tab holds
-/// it, and which workspace that tab belongs to.
-///
-/// Two Herdr calls on top of `pane_details`, so it runs only for a notification
-/// that is actually going to be shown, and neither runs past `deadline`.
-/// Best-effort by design: every field stays empty when Herdr cannot answer in
-/// time, and the notification then falls back to the event's own message.
-pub(crate) fn pane_row(
-    pane_id: &str,
-    details: Option<&PaneDetails>,
-    herdr_bin: &str,
-    deadline: Instant,
-) -> PaneMetadata {
+/// The label of the workspace that holds the pane. Like every lookup behind a
+/// notification's text it is best-effort: None when Herdr cannot answer by
+/// `deadline`, and the notification then keeps the event's own copy.
+pub(crate) fn workspace_label(pane_id: &str, herdr_bin: &str, deadline: Instant) -> Option<String> {
     let workspace = crate::util::workspace_id_from_pane_id(pane_id).unwrap_or("default");
-    let workspace_label = command_stdout_until(herdr_bin, &["workspace", "list"], &[], deadline)
-        .and_then(|json| {
-            workspace_label_from_list_json(&json, workspace)
-                .ok()
-                .flatten()
-        });
-    let tab_label = details
-        .and_then(|details| details.tab_id.as_deref())
-        .and_then(|tab_id| command_stdout_until(herdr_bin, &["tab", "get", tab_id], &[], deadline))
-        .and_then(|json| tab_label_from_get_json(&json).ok().flatten());
+    let json = command_stdout_until(herdr_bin, &["workspace", "list"], &[], deadline)?;
+    workspace_label_from_list_json(&json, workspace)
+        .ok()
+        .flatten()
+}
 
-    PaneMetadata {
-        cwd: details.and_then(|details| details.cwd.clone()),
-        terminal_title: details.and_then(|details| details.terminal_title.clone()),
-        tab_label,
-        workspace_label,
-    }
+/// The label of the tab that holds the pane; an unnamed tab is known by its
+/// number. Best-effort, like `workspace_label`.
+pub(crate) fn tab_label(tab_id: &str, herdr_bin: &str, deadline: Instant) -> Option<String> {
+    let json = command_stdout_until(herdr_bin, &["tab", "get", tab_id], &[], deadline)?;
+    tab_label_from_get_json(&json).ok().flatten()
 }
 
 /// The branch the pane's directory is on, from Herdr's own worktree view: it is
@@ -195,7 +152,7 @@ pub(crate) fn worktree_branch(cwd: &str, herdr_bin: &str, deadline: Instant) -> 
 }
 
 fn branch_from_worktree_list_json(json: &str, cwd: &str) -> Result<Option<String>, String> {
-    let envelope: WorktreeListEnvelope =
+    let envelope: Envelope<WorktreeListResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid worktree list json: {err}"))?;
 
     let Some(result) = envelope.result else {
@@ -237,7 +194,7 @@ fn pane_details_from_get_json(
     json: &str,
     expected_pane_id: &str,
 ) -> Result<Option<PaneDetails>, String> {
-    let envelope: AgentGetEnvelope =
+    let envelope: Envelope<AgentGetResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid agent get json: {err}"))?;
 
     Ok(envelope
@@ -256,7 +213,7 @@ fn pane_details_from_get_json(
 }
 
 fn tab_label_from_get_json(json: &str) -> Result<Option<String>, String> {
-    let envelope: TabGetEnvelope =
+    let envelope: Envelope<TabGetResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid tab get json: {err}"))?;
 
     // Herdr already labels an unnamed tab with its number, as the sidebar
@@ -276,7 +233,7 @@ fn workspace_label_from_list_json(
     json: &str,
     workspace_id: &str,
 ) -> Result<Option<String>, String> {
-    let envelope: WorkspaceListEnvelope =
+    let envelope: Envelope<WorkspaceListResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid workspace list json: {err}"))?;
 
     Ok(envelope
@@ -407,6 +364,11 @@ fn activate_terminal(bundle_id: &str) -> Result<(), String> {
 /// `focused` comes from the caller's `pane_details`, so one `herdr agent get`
 /// serves both this decision and the notification's own row.
 pub(crate) fn notification_decision(pane_id: &str, focused: bool) -> NotificationDecision {
+    // An unfocused pane always sends, so the binding and the frontmost app
+    // are not worth looking up.
+    if !focused {
+        return NotificationDecision::Send;
+    }
     let workspace = crate::util::workspace_id_from_pane_id(pane_id).unwrap_or("default");
     notification_decision_from_focus_and_bundles(
         focused,
@@ -496,7 +458,7 @@ fn focused_pane_id(herdr_bin: &str) -> Option<String> {
 }
 
 fn focused_pane_id_from_pane_list_json(json: &str) -> Result<Option<String>, String> {
-    let envelope: PaneListEnvelope =
+    let envelope: Envelope<PaneListResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid pane list json: {err}"))?;
 
     Ok(envelope.result.and_then(|result| {
@@ -529,7 +491,7 @@ pub(crate) fn live_workspace_ids(herdr_bin: &str) -> Option<Vec<String>> {
 }
 
 fn live_workspace_ids_from_pane_list_json(json: &str) -> Result<Option<Vec<String>>, String> {
-    let envelope: PaneListEnvelope =
+    let envelope: Envelope<PaneListResult> =
         serde_json::from_str(json).map_err(|err| format!("invalid pane list json: {err}"))?;
 
     let mut seen: Vec<String> = Vec::new();

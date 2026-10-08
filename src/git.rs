@@ -1,9 +1,7 @@
 //! How much the pane's directory has changed versus `HEAD`.
 //!
-//! The branch next to these counts comes from Herdr's own `worktree list`,
-//! not from here: it is the same source the Agent sidebar uses, and it still
-//! answers for a repository that has no commits yet, where `git status` reports
-//! `## No commits yet on main` instead of a branch name.
+//! The branch next to these counts comes from Herdr, not from here: see
+//! `focus::worktree_branch`.
 
 use std::time::Instant;
 

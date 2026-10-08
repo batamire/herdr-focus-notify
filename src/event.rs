@@ -71,23 +71,20 @@ pub(crate) fn notification_from_event_json(
             .map(String::as_str),
     ]);
 
-    let title = capitalize(&status);
-    let body = detail
-        .map(str::to_string)
-        .unwrap_or_else(|| match status.as_str() {
-            "blocked" => "Open the pane to review and respond.".to_string(),
-            "done" => "Open the pane to review the result.".to_string(),
-            _ => unreachable!("status already filtered"),
-        });
+    let (title, fallback_body) = match status.as_str() {
+        "blocked" => ("Blocked", "Open the pane to review and respond."),
+        "done" => ("Done", "Open the pane to review the result."),
+        _ => unreachable!("status already filtered"),
+    };
+    let body = detail.unwrap_or(fallback_body).to_string();
     let group = notification_group_id(&pane_id);
 
     Ok(Some(FocusNotification {
         pane_id,
         status,
-        agent,
-        title,
+        title: title.to_string(),
         body,
-        subtitle: None,
+        subtitle: Some(agent),
         group,
         app_icon,
     }))
@@ -128,20 +125,21 @@ pub(crate) fn enrich_notification(
     terminal_title: Option<&str>,
     git_label: Option<&str>,
 ) {
-    for extra in [workspace_label, tab_label].into_iter().flatten() {
-        if let Some(extra) = trimmed(Some(extra)) {
-            notification.title.push_str(" · ");
-            notification.title.push_str(extra);
-        }
+    for extra in [workspace_label, tab_label].into_iter().filter_map(trimmed) {
+        notification.title.push_str(" · ");
+        notification.title.push_str(extra);
     }
 
-    let subtitle = [Some(notification.agent.as_str()), git_label]
-        .into_iter()
-        .flatten()
-        .filter_map(|part| trimmed(Some(part)))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    notification.subtitle = (!subtitle.is_empty()).then_some(subtitle);
+    // The event already put the agent in the subtitle; the git state joins it.
+    if let Some(git_label) = trimmed(git_label) {
+        match notification.subtitle.as_mut() {
+            Some(subtitle) => {
+                subtitle.push_str(" · ");
+                subtitle.push_str(git_label);
+            }
+            None => notification.subtitle = Some(git_label.to_string()),
+        }
+    }
 
     if let Some(task) = trimmed(terminal_title) {
         notification.body = task.to_string();
@@ -150,17 +148,6 @@ pub(crate) fn enrich_notification(
 
 fn trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-/// Herdr renders the state as an icon in the sidebar and words it lower-case
-/// in `state_text`; a notification headline starts with it, so the first
-/// letter is raised.
-fn capitalize(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]
@@ -186,10 +173,9 @@ mod tests {
 
         assert_eq!(notification.pane_id, "w1:p3");
         assert_eq!(notification.status, "blocked");
-        assert_eq!(notification.agent, "Codex");
         assert_eq!(notification.title, "Blocked");
         assert_eq!(notification.body, "Implement plugin");
-        assert_eq!(notification.subtitle, None);
+        assert_eq!(notification.subtitle.as_deref(), Some("Codex"));
         assert_eq!(notification.group, "herdr-w1-p3");
         assert!(notification
             .app_icon
